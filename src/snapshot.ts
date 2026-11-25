@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import { resolveClaudeDir, resolveCodexDir } from "./adapters.js";
 import { loadNotes } from "./notes.js";
 import {
   formatRelativeTime,
@@ -80,7 +82,8 @@ export function buildSessionStartSnapshot(
   }
   const recent = [...substantive, ...minor].slice(0, 5);
 
-  const notes = loadNotes(dataDir)
+  // Strictly read-only: SessionStart never writes or triggers legacy JSON migration
+  const notes = loadNotes(dataDir, { readOnly: true })
     .filter((n) => noteWorkspaceMatches(n.workspace, primaryWs))
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
     .slice(0, 5);
@@ -92,7 +95,7 @@ export function buildSessionStartSnapshot(
   const lines = ["[agy-memory] Local cross-conversation context (read-only snapshot):"];
   if (currentId) {
     const shortCur = currentId.slice(0, 8);
-    lines.push(`Current session: ${shortCur} (pass excludeSessionId="${shortCur}" when searching past sessions)`);
+    lines.push(`Current session: ${shortCur} (pass excludeSessionId="agy:${currentId}" when searching past sessions)`);
   }
 
   if (recent.length > 0) {
@@ -120,14 +123,17 @@ export function buildSessionStartSnapshot(
     lines.push("Pinned notes:");
     for (const n of notes) {
       const text = String(n.content || "").replace(/\s+/g, " ").trim();
-      const clip = text.length > 180 ? `${safeSliceChars(text, 179)}…` : text;
+      const clip = text.length > 140 ? `${safeSliceChars(text, 139)}…` : text;
       const tagPart = Array.isArray(n.tags) && n.tags.length > 0 ? ` [${n.tags.join(", ")}]` : "";
       lines.push(`- [${n.id}] ${n.topic}${tagPart}: ${clip}`);
     }
   }
 
-  lines.push(
-    'Use mcp_agy-memory_memory_search_sessions / mcp_agy-memory_memory_read_session(mode="digest") when past session details are needed.',
-  );
+  const extAvail: string[] = [];
+  if (fs.existsSync(resolveCodexDir())) extAvail.push("codex");
+  if (fs.existsSync(resolveClaudeDir())) extAvail.push("claude");
+  const extHint = extAvail.length > 0 ? ` Cross-CLI sources: ${extAvail.join(", ")} (source="all").` : "";
+
+  lines.push(`Use agy-memory tools when needed.${extHint}`);
   return truncateUtf8(lines.join("\n"), 1650, 1800);
 }
