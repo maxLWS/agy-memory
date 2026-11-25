@@ -4,13 +4,16 @@
 
 # agy-memory
 
-**Fast, zero-dependency cross-conversation memory MCP plugin for Google Antigravity (`agy`)**
+**Local zero-dependency cross-conversation memory MCP plugin for Google Antigravity (`agy`)**
 
+[![CI](https://github.com/maxLWS/agy-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/maxLWS/agy-memory/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/maxLWS/agy-memory?style=flat-square&color=38BDF8)](https://github.com/maxLWS/agy-memory/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-22C55E?style=flat-square)](LICENSE)
 [![Node.js >= 20](https://img.shields.io/badge/node-%3E%3D20-38BDF8?style=flat-square)](package.json)
 [![Zero Runtime Deps](https://img.shields.io/badge/runtime%20deps-0-A78BFA?style=flat-square)](package.json)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-64748B?style=flat-square)](#quick-start)
 
-English · [简体中文](README.zh-CN.md) · [Quick Start](#quick-start) · [Benchmarks](#real-agy-ab-benchmarks) · [MCP Tools](#the-5-mcp-tools) · [Security](SECURITY.md) · [Changelog](CHANGELOG.md)
+English · [简体中文](README.zh-CN.md) · [Quick Start](#quick-start) · [Benchmarks](#real-agy-ab-benchmarks) · [Benchmark Report](docs/BENCHMARK_REPORT.md) · [MCP Tools](#the-5-mcp-tools) · [Security](SECURITY.md)
 
 </div>
 
@@ -22,7 +25,11 @@ English · [简体中文](README.zh-CN.md) · [Quick Start](#quick-start) · [Be
 | :---: | :---: | :---: | :---: | :---: |
 | **-64.1%** | **-58.8%** | **-57.7%** | **-46.5%** | **10 → 0 (-100%)** |
 
-*Measured across 7 real cross-conversation recall tasks on a frozen 139-session local corpus (`v0.2.0` vs. baseline without `agy-memory`, pinned model).*
+<p align="center">
+  <img src="assets/before-after.svg" alt="agy-memory Before vs After real agy A/B comparison: 14 turns / 91.1s / 2 disk spills reduced to 3 turns / 24.3s / 0 disk spills" width="100%" />
+</p>
+
+*Measured across 7 real cross-conversation recall tasks on a frozen 139-session local corpus (`v0.2.0` vs. baseline without `agy-memory`, pinned model). Full failure analysis (`v0.1.0` → `v0.2.0`): [Benchmark & Iteration Report](docs/BENCHMARK_REPORT.md).*
 
 ## Quick Start
 
@@ -42,7 +49,16 @@ curl -fsSL https://raw.githubusercontent.com/maxLWS/agy-memory/main/install.sh |
 irm https://raw.githubusercontent.com/maxLWS/agy-memory/main/install.ps1 | iex
 ```
 
-### Local Clone or Project-Only Install
+### Or Ask Antigravity to Install It for You
+
+Paste this single sentence into any Antigravity session:
+
+```text
+Clone https://github.com/maxLWS/agy-memory.git, run `node scripts/install.mjs install && node scripts/install.mjs doctor` inside it to install and verify the agy-memory plugin, and enable it in agy.
+```
+
+<details>
+<summary>More install options (local clone, project-only install, manual validation)</summary>
 
 ```bash
 git clone https://github.com/maxLWS/agy-memory.git
@@ -58,7 +74,9 @@ node scripts/install.mjs install --project /path/to/repo
 node scripts/install.mjs doctor
 ```
 
-Start a new `agy` session after installing; Antigravity automatically discovers and loads the plugin.
+</details>
+
+Start a **new** `agy` session after installing; Antigravity automatically discovers and loads the plugin.
 
 ## Architecture & Components
 
@@ -85,15 +103,7 @@ All 5 tools are registered as `eager: true` and enforce a strict `<=8,650`-byte 
 
 ## Real `agy` A/B Benchmarks
 
-Evaluated with real `agy -p --output-format json` executions against a frozen 139-session local corpus using isolated per-task `HOME` environments, identical prompts, and a single pinned model (`gemini-3.8-flash-medium`) across 7 sanitized task categories:
-
-- **T1**: Cross-session CJK + English factual lookup
-- **T2**: Multi-hop engineering decision recall inside a long conversation
-- **T3**: Long Swarm collaboration board inspection (85+ messages)
-- **T4**: Past Markdown artifact discovery & full retrieval
-- **T5**: Same-workspace recent session disambiguation
-- **T6**: Cross-session note write in Session A → recall in fresh Session B
-- **T7**: Negative / anti-hallucination query (nonexistent codename)
+Evaluated with real `agy -p --output-format json` executions against a frozen 139-session local corpus using isolated per-task `HOME` environments, identical prompts, and a single pinned model (`gemini-3.8-flash-medium`). See the full failure analysis and per-task breakdown in [`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md).
 
 | Arm | Pass Rate | Model Time | Wall Time | LLM Turns | Tool Calls (`mem` / `raw`) | Uncached Input | Cache Read | Output | Est. Billable Eq\* | Payload KB | Disk Spills |
 | :--- | :---: | ---: | ---: | ---: | :---: | ---: | ---: | ---: | ---: | ---: | :---: |

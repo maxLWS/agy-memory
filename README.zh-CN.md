@@ -6,11 +6,14 @@
 
 **面向 Google Antigravity (`agy`) 的零依赖本地跨对话记忆 MCP 插件**
 
+[![CI](https://github.com/maxLWS/agy-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/maxLWS/agy-memory/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/maxLWS/agy-memory?style=flat-square&color=38BDF8)](https://github.com/maxLWS/agy-memory/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-22C55E?style=flat-square)](LICENSE)
 [![Node.js >= 20](https://img.shields.io/badge/node-%3E%3D20-38BDF8?style=flat-square)](package.json)
 [![Zero Runtime Deps](https://img.shields.io/badge/runtime%20deps-0-A78BFA?style=flat-square)](package.json)
+[![支持平台](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-64748B?style=flat-square)](#快速安装)
 
-[English](README.md) · 简体中文 · [快速安装](#快速安装) · [实测基准](#真实-agy-ab-定量基准) · [核心工具](#5-个-mcp-工具) · [安全与隐私](SECURITY.md) · [更新日志](CHANGELOG.md)
+[English](README.md) · 简体中文 · [快速安装](#快速安装) · [实测基准](#真实-agy-ab-定量基准) · [实测复盘报告](docs/BENCHMARK_REPORT.zh-CN.md) · [核心工具](#5-个-mcp-工具) · [安全与隐私](SECURITY.md)
 
 </div>
 
@@ -22,7 +25,11 @@
 | :---: | :---: | :---: | :---: | :---: |
 | **-64.1%** | **-58.8%** | **-57.7%** | **-46.5%** | **10 → 0 (-100%)** |
 
-*基于冻结的 139 条本地真实历史会话、7 类跨对话检索任务、固定同一模型进行真实 `agy -p` A/B 实测（`v0.2.0` 对比无插件基线）。*
+<p align="center">
+  <img src="assets/before-after-zh.svg" alt="agy-memory 真实 agy A/B 对比实测：长 Swarm 回溯从 14 轮 91.1s 2 次溢盘降至 3 轮 24.3s 0 溢盘" width="100%" />
+</p>
+
+*基于冻结的 139 条本地真实历史会话、7 类跨对话检索任务、固定同一模型进行真实 `agy -p` A/B 实测（`v0.2.0` 对比无插件基线）。完整踩坑与 `v0.1.0 → v0.2.0` 迭代剖析见：[真实 `agy` 定量评测与迭代复盘报告](docs/BENCHMARK_REPORT.zh-CN.md)。*
 
 ## 快速安装
 
@@ -42,7 +49,16 @@ curl -fsSL https://raw.githubusercontent.com/maxLWS/agy-memory/main/install.sh |
 irm https://raw.githubusercontent.com/maxLWS/agy-memory/main/install.ps1 | iex
 ```
 
-### 本地克隆或仅项目级安装
+### 或者直接让 Antigravity 帮你自动安装
+
+把下面这句话直接发给 Antigravity 即可：
+
+```text
+请将 https://github.com/maxLWS/agy-memory.git 克隆到本地，运行 `node scripts/install.mjs install && node scripts/install.mjs doctor` 安装并验证 agy-memory 插件，然后在 agy 中启用它。
+```
+
+<details>
+<summary>更多安装方式（本地克隆、单项目安装、自检校验）</summary>
 
 ```bash
 git clone https://github.com/maxLWS/agy-memory.git
@@ -58,7 +74,9 @@ node scripts/install.mjs install --project /path/to/repo
 node scripts/install.mjs doctor
 ```
 
-安装完成后新开一条 `agy` 对话即可自动生效。
+</details>
+
+安装完成后**新开一条 `agy` 对话**即可自动生效。
 
 ## 插件组成
 
@@ -85,15 +103,7 @@ node scripts/install.mjs doctor
 
 ## 真实 `agy` A/B 定量基准
 
-基于冻结的 139 条本地会话快照，按任务完全隔离 `HOME` 环境，固定同一模型（`gemini-3.8-flash-medium`）与相同提示词，使用真实 `agy -p --output-format json` 执行 7 类跨对话任务（已脱敏）：
-
-- **T1**：中英文混合关键词跨会话事实检索
-- **T2**：长对话内的多跳工程决策回溯
-- **T3**：85+ 条消息的长 Swarm 协作留言板回溯
-- **T4**：历史 Markdown Artifact 定位与完整读取
-- **T5**：同工作区近期实质会话消歧
-- **T6**：跨会话写入笔记（会话 A）→ 新会话召回（会话 B）
-- **T7**：不存在代号的防幻觉负例查询
+基于冻结的 139 条本地会话快照，按任务完全隔离 `HOME` 环境，固定同一模型（`gemini-3.8-flash-medium`）与相同提示词，使用真实 `agy -p --output-format json` 执行 7 类跨对话任务。完整初版失败分析与逐题数据见 [`docs/BENCHMARK_REPORT.zh-CN.md`](docs/BENCHMARK_REPORT.zh-CN.md)。
 
 | 方案 | 通过率 | 模型耗时 | 总墙钟耗时 | LLM 轮次 | 工具调用（记忆/原生） | 未命中缓存输入 | 缓存命中读取 | 输出 Token | 估算计费等效\* | 返回体积 | 磁盘溢出 |
 | :--- | :---: | ---: | ---: | ---: | :---: | ---: | ---: | ---: | ---: | ---: | :---: |
