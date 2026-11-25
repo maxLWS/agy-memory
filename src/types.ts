@@ -1,3 +1,6 @@
+export type HarnessSource = "agy" | "codex" | "claude";
+export type SourceFilter = HarnessSource | "all";
+
 export interface ToolResult {
   text: string;
   isError: boolean;
@@ -29,6 +32,8 @@ export interface RawSummaryRow {
 }
 
 export interface SessionEntry {
+  source: HarnessSource;
+  canonicalId: string; // `${source}:${sessionId}`
   sessionId: string;
   shortId: string;
   title: string;
@@ -125,6 +130,56 @@ export interface SearchableSessionDoc {
   inFlightUserStepIndex: number;
 }
 
+export type FileActionOutcome = "read" | "write_succeeded" | "write_failed" | "write_unverified";
+
+export interface TraceFileEvent {
+  stepIndex: number;
+  date: string;
+  toolName: string;
+  rawPath: string;
+  resolvedPath: string;
+  basename: string;
+  outcome: FileActionOutcome;
+  userPrompt: string;
+  assistantSnippet: string;
+}
+
+export interface TraceErrorEvent {
+  stepIndex: number;
+  resultStepIndex: number;
+  date: string;
+  toolName: string;
+  invocation: string;
+  errorSnippet: string;
+  exitCode: number | null;
+  commandKey: string;
+  userPrompt: string;
+}
+
+export interface TracePassEvent {
+  stepIndex: number;
+  date: string;
+  toolName: string;
+  invocation: string;
+  commandKey: string;
+}
+
+export interface SessionTraceDoc {
+  fileEvents: TraceFileEvent[];
+  errorEvents: TraceErrorEvent[];
+  passEvents: TracePassEvent[];
+}
+
+export interface ScanBudget {
+  maxScanBytes: number;
+  maxScanMs: number;
+  startedAtMs: number;
+  bytesRead: number;
+  sessionsScanned: number;
+  incomplete: boolean;
+  reason: string;
+}
+
 export interface NoteItem {
   id: string;
   topic: string;
@@ -134,6 +189,15 @@ export interface NoteItem {
   sessionId: string;
   createdAt: number;
   updatedAt: number;
+  filePath?: string;
+  revision?: string;
+}
+
+export interface NoteLoadResult {
+  notes: NoteItem[];
+  warnings: string[];
+  memoryIndexPath: string;
+  topicsDir: string;
 }
 
 export interface MemoryToolCallCounts {
