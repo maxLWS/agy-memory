@@ -697,8 +697,28 @@ test("bundled MCP stdio server handles JSONL, LSP (Content-Type before Content-L
 
     assert.equal(responses.length, 6);
     assert.equal(responses[0]!.id, 0);
-    assert.equal(((responses[0]!.result as Record<string, unknown>).serverInfo as Record<string, unknown>).version, "0.3.0");
-    assert.equal(((responses[1]!.result as Record<string, unknown>).tools as unknown[]).length, 5);
+    const initResult = responses[0]!.result as Record<string, unknown>;
+    assert.equal((initResult.serverInfo as Record<string, unknown>).version, "0.3.0");
+    assert.ok(typeof initResult.instructions === "string" && initResult.instructions.includes("list_sessions"));
+    const listedTools = (responses[1]!.result as Record<string, unknown>).tools as Array<{
+      name: string;
+      description: string;
+      annotations?: Record<string, unknown>;
+    }>;
+    assert.equal(listedTools.length, 5);
+    for (const tool of listedTools) {
+      assert.ok(tool.annotations && typeof tool.annotations.title === "string", `missing annotations on ${tool.name}`);
+      assert.equal(tool.annotations.openWorldHint, false, `${tool.name} should be local-only`);
+      if (tool.name === "save_note") {
+        assert.equal(tool.annotations.readOnlyHint, false);
+        assert.equal(tool.annotations.destructiveHint, true);
+        assert.equal(tool.annotations.idempotentHint, false);
+      } else {
+        assert.equal(tool.annotations.readOnlyHint, true, `${tool.name} should be readOnlyHint=true`);
+        assert.equal(tool.annotations.destructiveHint, false);
+        assert.equal(tool.annotations.idempotentHint, true);
+      }
+    }
     const searchText = (((responses[2]!.result as Record<string, unknown>).content as Array<{ text: string }>)[0]!).text;
     assert.ok(searchText.includes(hasDb ? "Terminal Link Wrapping Fix" : "22222222"), searchText);
     assert.equal((responses[3]!.result as Record<string, unknown>).isError, true);

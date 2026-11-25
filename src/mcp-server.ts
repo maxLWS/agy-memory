@@ -76,6 +76,8 @@ function handleJsonRpcMessage(msg: unknown): JsonRpcResponse | null {
             tools: { listChanged: false },
           },
           serverInfo: SERVER_INFO,
+          instructions:
+            "Local cross-conversation memory for Google Antigravity (agy), Codex, and Claude Code. Browse recent IDs with list_sessions, find matching sessions/edits/errors with search_sessions (use mode='error_history' for failed commands/tests), inspect one session with read_session (digest -> turns/artifacts/swarm), and manage durable Markdown notes with recall_notes and save_note (pass expectedRevision for CAS updates/deletes).",
         },
       };
     }
