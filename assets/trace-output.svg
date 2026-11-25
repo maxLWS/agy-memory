@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 320" fill="none">
+  <rect width="960" height="320" rx="12" fill="#0F172A"/>
+  <rect x="0.75" y="0.75" width="958.5" height="318.5" rx="11.25" stroke="#334155" stroke-width="1.5"/>
+
+  <!-- Card 1: file_history -->
+  <rect x="18" y="18" width="298" height="284" rx="8" fill="#1E293B" stroke="#334155" stroke-width="1"/>
+  <circle cx="34" cy="34" r="4" fill="#EF4444"/>
+  <circle cx="48" cy="34" r="4" fill="#F59E0B"/>
+  <circle cx="62" cy="34" r="4" fill="#10B981"/>
+  <text x="76" y="38" fill="#93C5FD" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="700">mode="file_history"</text>
+  <line x1="18" y1="49" x2="316" y2="49" stroke="#334155" stroke-width="1"/>
+
+  <text x="28" y="68" fill="#94A3B8" font-family="ui-monospace, Menlo, monospace" font-size="10">$ search --mode file_history utils.py</text>
+  <text x="28" y="88" fill="#E2E8F0" font-family="ui-monospace, Menlo, monospace" font-size="10">Disambiguation (2 paths):</text>
+  <text x="28" y="104" fill="#34D399" font-family="ui-monospace, Menlo, monospace" font-size="9.5">- core/utils.py (2 write, 1 read)</text>
+  <text x="28" y="119" fill="#94A3B8" font-family="ui-monospace, Menlo, monospace" font-size="9.5">- api/utils.py  (0 write, 3 read)</text>
+
+  <text x="28" y="144" fill="#F8FAFC" font-family="ui-monospace, Menlo, monospace" font-size="10" font-weight="700">### deadbeef — Cache Key Fix</text>
+  <text x="28" y="160" fill="#34D399" font-family="ui-monospace, Menlo, monospace" font-size="9.5">2 write_succeeded, 0 write_failed</text>
+  <text x="28" y="175" fill="#CBD5E1" font-family="ui-monospace, Menlo, monospace" font-size="9.5">Write steps: #1, #9</text>
+  <text x="28" y="191" fill="#94A3B8" font-family="ui-monospace, Menlo, monospace" font-size="9.5">[user @#1] Fix cache salt bug</text>
+
+  <text x="28" y="218" fill="#F8FAFC" font-family="ui-monospace, Menlo, monospace" font-size="10" font-weight="700">### 4a1b9c02 — Perf Review</text>
+  <text x="28" y="234" fill="#FBBF24" font-family="ui-monospace, Menlo, monospace" font-size="9.5">0 write_succeeded, 4 read</text>
+  <text x="28" y="249" fill="#CBD5E1" font-family="ui-monospace, Menlo, monospace" font-size="9.5">Read steps: #12, #18</text>
+  <text x="28" y="286" fill="#64748B" font-family="ui-monospace, Menlo, monospace" font-size="9.5">Complete scan: 70/70 agy sessions</text>
+
+  <!-- Card 2: error_history -->
+  <rect x="331" y="18" width="298" height="284" rx="8" fill="#1E293B" stroke="#334155" stroke-width="1"/>
+  <circle cx="347" cy="34" r="4" fill="#EF4444"/>
+  <circle cx="361" cy="34" r="4" fill="#F59E0B"/>
+  <circle cx="375" cy="34" r="4" fill="#10B981"/>
+  <text x="389" y="38" fill="#FCA5A5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="700">mode="error_history"</text>
+  <line x1="331" y1="49" x2="629" y2="49" stroke="#334155" stroke-width="1"/>
+
+  <text x="341" y="68" fill="#94A3B8" font-family="ui-monospace, Menlo, monospace" font-size="10">$ search --mode error_history pytest</text>
+  <text x="341" y="92" fill="#F8FAFC" font-family="ui-monospace, Menlo, monospace" font-size="10" font-weight="700">### deadbeef — Cache Key Fix</text>
+  <text x="341" y="110" fill="#FCA5A5" font-family="ui-monospace, Menlo, monospace" font-size="9.5">[#7→#8 exit=1] pytest test_cache.py</text>
+  <text x="341" y="126" fill="#CBD5E1" font-family="ui-monospace, Menlo, monospace" font-size="9.5">Error: KeyError cache_salt_missing</text>
+  <text x="341" y="144" fill="#94A3B8" font-family="ui-monospace, Menlo, monospace" font-size="9.5">Subsequent edits (candidate):</text>
+  <text x="341" y="159" fill="#CBD5E1" font-family="ui-monospace, Menlo, monospace" font-size="9.5">  core/utils.py (#9)</text>
+  <text x="341" y="177" fill="#34D399" font-family="ui-monospace, Menlo, monospace" font-size="9.5">Later rerun: PASSED at #11</text>
+
+  <text x="341" y="206" fill="#FCA5A5" font-family="ui-monospace, Menlo, monospace" font-size="9.5">[#13→#14 exit=2] pytest test_alpha.py</text>
+  <text x="341" y="222" fill="#CBD5E1" font-family="ui-monospace, Menlo, monospace" font-size="9.5">Error: AssertionError alpha_only</text>
+  <text x="341" y="239" fill="#FBBF24" font-family="ui-monospace, Menlo, monospace" font-size="9.5">Later rerun: UNRESOLVED</text>
+  <text x="341" y="254" fill="#64748B" font-family="ui-monospace, Menlo, monospace" font-size="9">(exact command+cwd match required)</text>
+  <text x="341" y="286" fill="#64748B" font-family="ui-monospace, Menlo, monospace" font-size="9.5">Complete scan: 70/70 agy sessions</text>
+
+  <!-- Card 3: Cross-CLI & Markdown Notes -->
+  <rect x="644" y="18" width="298" height="284" rx="8" fill="#1E293B" stroke="#334155" stroke-width="1"/>
+  <circle cx="660" cy="34" r="4" fill="#EF4444"/>
+  <circle cx="674" cy="34" r="4" fill="#F59E0B"/>
+  <circle cx="688" cy="34" r="4" fill="#10B981"/>
+  <text x="702" y="38" fill="#A7F3D0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="700">source="all" &amp; notes</text>
+  <line x1="644" y1="49" x2="942" y2="49" stroke="#334155" stroke-width="1"/>
+
+  <text x="654" y="68" fill="#94A3B8" font-family="ui-monospace, Menlo, monospace" font-size="10">$ search --source all "backoff"</text>
+  <text x="654" y="90" fill="#F8FAFC" font-family="ui-monospace, Menlo, monospace" font-size="10" font-weight="700">### codex:01ab34cd — Retry Patch</text>
+  <text x="654" y="106" fill="#93C5FD" font-family="ui-monospace, Menlo, monospace" font-size="9.5">ID: codex:01ab34cd-6e51-...</text>
+  <text x="654" y="122" fill="#CBD5E1" font-family="ui-monospace, Menlo, monospace" font-size="9.5">[assistant #8] Set base to 250ms</text>
+
+  <text x="654" y="148" fill="#F8FAFC" font-family="ui-monospace, Menlo, monospace" font-size="10" font-weight="700">### claude:ses_25ab12 — DB Locks</text>
+  <text x="654" y="164" fill="#C4B5FD" font-family="ui-monospace, Menlo, monospace" font-size="9.5">ID: claude:ses_25ab12...</text>
+  <text x="654" y="180" fill="#CBD5E1" font-family="ui-monospace, Menlo, monospace" font-size="9.5">[assistant #4] Advisory xact lock</text>
+
+  <line x1="654" y1="198" x2="930" y2="198" stroke="#334155" stroke-width="1"/>
+  <text x="654" y="218" fill="#94A3B8" font-family="ui-monospace, Menlo, monospace" font-size="10">$ note-recall "TTL"</text>
+  <text x="654" y="236" fill="#34D399" font-family="ui-monospace, Menlo, monospace" font-size="9.5">[a1b2c3d4] Cache TTL [cache, ops]</text>
+  <text x="654" y="252" fill="#CBD5E1" font-family="ui-monospace, Menlo, monospace" font-size="9.5">Path: .../topics/a1b2c3d4.md</text>
+  <text x="654" y="268" fill="#93C5FD" font-family="ui-monospace, Menlo, monospace" font-size="9.5">Revision: 9f4e2a1b8c7d (CAS)</text>
+  <text x="654" y="286" fill="#64748B" font-family="ui-monospace, Menlo, monospace" font-size="9.5">MEMORY.md index stays human-editable</text>
+</svg>

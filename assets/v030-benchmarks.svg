@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 410" fill="none">
+  <rect width="960" height="410" rx="12" fill="#FFFFFF"/>
+  <rect x="0.75" y="0.75" width="958.5" height="408.5" rx="11.25" stroke="#E2E8F0" stroke-width="1.5"/>
+
+  <!-- Header -->
+  <text x="28" y="34" fill="#0F172A" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="16" font-weight="700">Real agy -p Benchmarks (v0.3.0)</text>
+  <text x="28" y="54" fill="#64748B" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12">Frozen 139-session snapshot (+6 Codex, +6 Claude) · isolated HOME per run · pinned gemini-3.8-flash-medium</text>
+
+  <!-- Legend -->
+  <rect x="655" y="22" width="12" height="12" rx="3" fill="#CBD5E1"/>
+  <text x="673" y="32" fill="#475569" font-family="ui-sans-serif, -apple-system, sans-serif" font-size="11.5">Baseline / Off</text>
+  <rect x="765" y="22" width="12" height="12" rx="3" fill="#60A5FA"/>
+  <text x="783" y="32" fill="#475569" font-family="ui-sans-serif, -apple-system, sans-serif" font-size="11.5">v0.2.0</text>
+  <rect x="840" y="22" width="12" height="12" rx="3" fill="#10B981"/>
+  <text x="858" y="32" fill="#0F172A" font-family="ui-sans-serif, -apple-system, sans-serif" font-size="11.5" font-weight="600">v0.3.0</text>
+
+  <!-- Left Panel: Core Recall T1-T7 -->
+  <rect x="24" y="72" width="444" height="314" rx="10" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1.2"/>
+  <text x="40" y="96" fill="#0F172A" font-family="ui-sans-serif, -apple-system, sans-serif" font-size="13" font-weight="700">Core Recall Suite (T1–T7, 7/7 pass)</text>
+
+  <!-- Metric 1: Model Time -->
+  <text x="40" y="124" fill="#334155" font-family="ui-sans-serif, -apple-system, sans-serif" font-size="11.5" font-weight="600">Model Time (lower is better)</text>
+  <rect x="40" y="132" width="330" height="14" rx="3" fill="#CBD5E1"/>
+  <text x="378" y="143" fill="#64748B" font-family="ui-monospace, Menlo, monospace" font-size="11">594.4s</text>
+  <rect x="40" y="150" width="118" height="14" rx="3" fill="#60A5FA"/>
+  <text x="166" y="161" fill="#1D4ED8" font-family="ui-monospace, Menlo, monospace" font-size="11">213.2s</text>
+  <rect x="40" y="168" width="116" height="14" rx="3" fill="#10B981"/>
+  <text x="164" y="179" fill="#047857" font-family="ui-monospace, Menlo, monospace" font-size="11" font-weight="700">208.7s (-64.9%)</text>
+
+  <!-- Metric 2: LLM Turns -->
+  <text x="40" y="206" fill="#334155" font-family="ui-sans-serif, -apple-system, sans-serif" font-size="11.5" font-weight="600">Total LLM Turns</text>
+  <rect x="40" y="214" width="330" height="14" rx="3" fill="#CBD5E1"/>
+  <text x="378" y="225" fill="#64748B" font-family="ui-monospace, Menlo, monospace" font-size="11">71</text>
+  <rect x="40" y="232" width="139" height="14" rx="3" fill="#60A5FA"/>
+  <text x="187" y="243" fill="#1D4ED8" font-family="ui-monospace, Menlo, monospace" font-size="11">30</text>
+  <rect x="40" y="250" width="135" height="14" rx="3" fill="#10B981"/>
+  <text x="183" y="261" fill="#047857" font-family="ui-monospace, Menlo, monospace" font-size="11" font-weight="700">29 (-59.2%)</text>
+
+  <!-- Metric 3: Est. Billable Tokens -->
+  <text x="40" y="288" fill="#334155" font-family="ui-sans-serif, -apple-system, sans-serif" font-size="11.5" font-weight="600">Est. Billable Tokens</text>
+  <rect x="40" y="296" width="330" height="14" rx="3" fill="#CBD5E1"/>
+  <text x="378" y="307" fill="#64748B" font-family="ui-monospace, Menlo, monospace" font-size="11">699k</text>
+  <rect x="40" y="314" width="176" height="14" rx="3" fill="#60A5FA"/>
+  <text x="224" y="325" fill="#1D4ED8" font-family="ui-monospace, Menlo, monospace" font-size="11">374k</text>
+  <rect x="40" y="332" width="177" height="14" rx="3" fill="#10B981"/>
+  <text x="225" y="343" fill="#047857" font-family="ui-monospace, Menlo, monospace" font-size="11" font-weight="700">375k (-46.3%)</text>
+
+  <text x="40" y="372" fill="#475569" font-family="ui-sans-serif, -apple-system, sans-serif" font-size="11">Disk spills: 10 (Baseline) → 0 (v0.2.0) → 0 (v0.3.0 patched)</text>
+
+  <!-- Right Panel: v0.3.0 Targeted Ablations -->
+  <rect x="488" y="72" width="448" height="314" rx="10" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1.2"/>
+  <text x="504" y="96" fill="#0F172A" font-family="ui-sans-serif, -apple-system, sans-serif" font-size="13" font-weight="700">v0.3.0 Feature Ablations (Wall Time)</text>
+
+  <!-- Ablation 1: file_history -->
+  <text x="504" y="124" fill="#334155" font-family="ui-sans-serif, -apple-system, sans-serif" font-size="11.5" font-weight="600">T8 · File Edit vs. Read (mode="file_history")</text>
+  <rect x="504" y="132" width="290" height="14" rx="3" fill="#CBD5E1"/>
+  <text x="802" y="143" fill="#64748B" font-family="ui-monospace, Menlo, monospace" font-size="11">122.0s · 14t (off)</text>
+  <rect x="504" y="150" width="214" height="14" rx="3" fill="#60A5FA"/>
+  <text x="726" y="161" fill="#1D4ED8" font-family="ui-monospace, Menlo, monospace" font-size="11">90.0s · 12t</text>
+  <rect x="504" y="168" width="51" height="14" rx="3" fill="#10B981"/>
+  <text x="563" y="179" fill="#047857" font-family="ui-monospace, Menlo, monospace" font-size="11" font-weight="700">21.6s · 3t (-82%)</text>
+
+  <!-- Ablation 2: error_history (n=5 paired) -->
+  <text x="504" y="206" fill="#334155" font-family="ui-sans-serif, -apple-system, sans-serif" font-size="11.5" font-weight="600">T9 · Command Error Trace (n=5 paired median)</text>
+  <rect x="504" y="214" width="218" height="14" rx="3" fill="#CBD5E1"/>
+  <text x="730" y="225" fill="#64748B" font-family="ui-monospace, Menlo, monospace" font-size="11">78.2s · 10t (4/5)</text>
+  <rect x="504" y="232" width="60" height="14" rx="3" fill="#10B981"/>
+  <text x="572" y="243" fill="#047857" font-family="ui-monospace, Menlo, monospace" font-size="11" font-weight="700">21.6s · 2t · 5/5 (-72%)</text>
+
+  <!-- Ablation 3: Cross-CLI -->
+  <text x="504" y="272" fill="#334155" font-family="ui-sans-serif, -apple-system, sans-serif" font-size="11.5" font-weight="600">T10 · Cross-CLI Recall (Codex + Claude)</text>
+  <rect x="504" y="280" width="320" height="14" rx="3" fill="#60A5FA"/>
+  <text x="832" y="291" fill="#1D4ED8" font-family="ui-monospace, Menlo, monospace" font-size="11">134.9s · 19t</text>
+  <rect x="504" y="298" width="134" height="14" rx="3" fill="#CBD5E1"/>
+  <text x="646" y="309" fill="#64748B" font-family="ui-monospace, Menlo, monospace" font-size="11">56.3s · 8t (shell)</text>
+  <rect x="504" y="316" width="52" height="14" rx="3" fill="#10B981"/>
+  <text x="564" y="327" fill="#047857" font-family="ui-monospace, Menlo, monospace" font-size="11" font-weight="700">21.9s · 3t (-61%)</text>
+
+  <!-- Footer callout -->
+  <rect x="504" y="346" width="416" height="28" rx="6" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="1"/>
+  <text x="514" y="364" fill="#065F46" font-family="ui-monospace, Menlo, monospace" font-size="10">Startup: 11.0 KB → 7.7 KB (-30.4%) · -633 Turn-1 tokens vs v0.2.0</text>
+</svg>
