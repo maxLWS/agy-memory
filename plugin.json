@@ -1,7 +1,7 @@
 {
   "name": "agy-memory",
   "displayName": "agy-memory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "logo": "assets/logo.svg",
   "description": "Fast, zero-dependency cross-conversation memory, full-reply search, Swarm board inspection, and persistent note MCP plugin for Antigravity.",
   "author": {

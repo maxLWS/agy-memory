@@ -697,7 +697,7 @@ test("bundled MCP stdio server handles JSONL, LSP (Content-Type before Content-L
 
     assert.equal(responses.length, 6);
     assert.equal(responses[0]!.id, 0);
-    assert.equal(((responses[0]!.result as Record<string, unknown>).serverInfo as Record<string, unknown>).version, "0.2.0");
+    assert.equal(((responses[0]!.result as Record<string, unknown>).serverInfo as Record<string, unknown>).version, "0.3.0");
     assert.equal(((responses[1]!.result as Record<string, unknown>).tools as unknown[]).length, 5);
     const searchText = (((responses[2]!.result as Record<string, unknown>).content as Array<{ text: string }>)[0]!).text;
     assert.ok(searchText.includes(hasDb ? "Terminal Link Wrapping Fix" : "22222222"), searchText);

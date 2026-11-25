@@ -1,6 +1,6 @@
 {
   "name": "agy-memory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Fast, zero-dependency cross-conversation memory, search, digest reader, and persistent note MCP plugin for Google Antigravity (agy).",
   "type": "module",
   "author": "maxLWS",

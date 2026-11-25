@@ -1,16 +1,32 @@
 // agy-memory SessionStart Hook (bundled zero-dependency ESM)
 
 
+// src/snapshot.ts
+import fs3 from "node:fs";
+
+// src/adapters.ts
+import os from "node:os";
+import path from "node:path";
+var HEAD_META_BYTES = 16 * 1024;
+var CHUNK_BYTES = 64 * 1024;
+function resolveCodexDir() {
+  return (process.env.CODEX_HOME || "").trim() || path.join(os.homedir(), ".codex");
+}
+function resolveClaudeDir() {
+  return (process.env.CLAUDE_CONFIG_DIR || "").trim() || path.join(os.homedir(), ".claude");
+}
+
 // src/notes.ts
+import crypto from "node:crypto";
 import fs2 from "node:fs";
-import path2 from "node:path";
+import path3 from "node:path";
 
 // src/store.ts
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import { createRequire } from "node:module";
-import os from "node:os";
-import path from "node:path";
+import os2 from "node:os";
+import path2 from "node:path";
 var TAIL_PREVIEW_BYTES = 160 * 1024;
 var TAIL_FALLBACK_BYTES = 1024 * 1024;
 var SQLITE_CANDIDATES = process.platform === "win32" ? ["sqlite3", "sqlite3.exe"] : ["sqlite3", "/usr/bin/sqlite3", "/usr/local/bin/sqlite3", "/opt/homebrew/bin/sqlite3"];
@@ -60,15 +76,15 @@ function statSignature(filePath) {
 }
 function resolveDataDir(overrideDir = "") {
   if (overrideDir && String(overrideDir).trim()) {
-    return path.resolve(String(overrideDir).trim());
+    return path2.resolve(String(overrideDir).trim());
   }
   const envDir = process.env.AGY_MEMORY_DATA_DIR || process.env.AGY_APP_DATA_DIR || "";
   if (envDir.trim()) {
-    return path.isAbsolute(envDir.trim()) ? envDir.trim() : path.join(os.homedir(), ".gemini", envDir.trim());
+    return path2.isAbsolute(envDir.trim()) ? envDir.trim() : path2.join(os2.homedir(), ".gemini", envDir.trim());
   }
-  const cliDir = path.join(os.homedir(), ".gemini", "antigravity-cli");
+  const cliDir = path2.join(os2.homedir(), ".gemini", "antigravity-cli");
   if (fs.existsSync(cliDir)) return cliDir;
-  const ideDir = path.join(os.homedir(), ".gemini", "antigravity");
+  const ideDir = path2.join(os2.homedir(), ".gemini", "antigravity");
   if (fs.existsSync(ideDir)) return ideDir;
   return cliDir;
 }
@@ -194,7 +210,7 @@ function isTempPath(rawPath) {
   if (norm === "/tmp" || norm.startsWith("/tmp/") || norm === "/private/tmp" || norm.startsWith("/private/tmp/")) {
     return true;
   }
-  const osTmp = normalizeFsPath(os.tmpdir());
+  const osTmp = normalizeFsPath(os2.tmpdir());
   if (osTmp && (norm === osTmp || norm.startsWith(`${osTmp}/`))) {
     return true;
   }
@@ -205,7 +221,7 @@ function formatWorkspaceLabel(rawPath) {
   if (!trimmed) return "";
   if (isTempPath(trimmed)) return trimmed;
   const slashNorm = trimmed.replace(/\\/g, "/").replace(/\/+$/, "");
-  return path.posix.basename(slashNorm) || trimmed;
+  return path2.posix.basename(slashNorm) || trimmed;
 }
 function workspaceMatches(workspaces, filter) {
   if (!filter) return true;
@@ -220,7 +236,7 @@ function workspaceMatches(workspaces, filter) {
     if (isAbsFilter) {
       return norm.startsWith(`${f}/`);
     }
-    const base = path.posix.basename(norm);
+    const base = path2.posix.basename(norm);
     return base === f || norm.endsWith(`/${f}`) || norm.includes(`/${f}/`);
   });
 }
@@ -234,7 +250,7 @@ function noteWorkspaceMatches(noteWorkspace, filterWorkspace) {
   if (isAbsFilter) {
     return nw.startsWith(`${fw}/`) || fw.startsWith(`${nw}/`);
   }
-  const base = path.posix.basename(nw);
+  const base = path2.posix.basename(nw);
   return base === fw || nw.endsWith(`/${fw}`) || nw.includes(`/${fw}/`);
 }
 function parseSessionIdList(spec) {
@@ -242,14 +258,26 @@ function parseSessionIdList(spec) {
   const rawItems = Array.isArray(spec) ? spec : String(spec).split(",");
   return rawItems.map((item) => String(item ?? "").trim().toLowerCase()).filter(Boolean);
 }
-function matchesSessionId(sessionId, filterSpec) {
+function splitCanonicalRef(ref) {
+  const clean = String(ref || "").trim();
+  const m = /^(agy|codex|claude):(.+)$/i.exec(clean);
+  if (m) {
+    return { source: m[1].toLowerCase(), id: m[2].trim() };
+  }
+  return { source: null, id: clean };
+}
+function matchesSessionId(sessionId, filterSpec, entrySource = "agy") {
   const targets = parseSessionIdList(filterSpec);
   if (targets.length === 0) return false;
   const sid = String(sessionId || "").trim().toLowerCase();
   if (!sid) return false;
-  return targets.some((target) => {
-    if (sid === target) return true;
-    if (target.length >= 4 && sid.startsWith(target)) return true;
+  return targets.some((rawTarget) => {
+    const { source: targetSrc, id: targetId } = splitCanonicalRef(rawTarget);
+    if (targetSrc && targetSrc !== entrySource) return false;
+    const tid = targetId.toLowerCase();
+    if (!tid) return false;
+    if (sid === tid) return true;
+    if (tid.length >= 4 && sid.startsWith(tid)) return true;
     return false;
   });
 }
@@ -281,27 +309,27 @@ function readTailUtf8(filePath, maxBytes) {
   }
 }
 function getSessionPaths(dataDir, sessionId) {
-  const brainDir = path.join(dataDir, "brain", sessionId);
-  const systemDir = path.join(brainDir, ".system_generated");
-  const logsDir = path.join(systemDir, "logs");
-  const swarmDir = path.join(systemDir, "swarm");
+  const brainDir = path2.join(dataDir, "brain", sessionId);
+  const systemDir = path2.join(brainDir, ".system_generated");
+  const logsDir = path2.join(systemDir, "logs");
+  const swarmDir = path2.join(systemDir, "swarm");
   return {
     brainDir,
     systemDir,
-    transcriptPath: path.join(logsDir, "transcript.jsonl"),
-    transcriptFullPath: path.join(logsDir, "transcript_full.jsonl"),
+    transcriptPath: path2.join(logsDir, "transcript.jsonl"),
+    transcriptFullPath: path2.join(logsDir, "transcript_full.jsonl"),
     swarmDir,
-    swarmMembersPath: path.join(swarmDir, "members.json"),
-    swarmBoardPath: path.join(swarmDir, "board.jsonl"),
-    swarmPlanPath: path.join(swarmDir, "plan.json"),
-    subagentsDir: path.join(systemDir, "subagents")
+    swarmMembersPath: path2.join(swarmDir, "members.json"),
+    swarmBoardPath: path2.join(swarmDir, "board.jsonl"),
+    swarmPlanPath: path2.join(swarmDir, "plan.json"),
+    subagentsDir: path2.join(systemDir, "subagents")
   };
 }
 function listSessionArtifactFiles(brainDir, { includeMeta = true } = {}) {
   try {
     const names = fs.readdirSync(brainDir).filter((name) => name.endsWith(".md") && !name.startsWith(".")).sort();
     return names.map((name) => {
-      const filePath = path.join(brainDir, name);
+      const filePath = path2.join(brainDir, name);
       let updatedAt = 0;
       let size = 0;
       try {
@@ -509,7 +537,7 @@ print(json.dumps(out))
   return null;
 }
 function scanBrainDirsFallback(dataDir) {
-  const brainRoot = path.join(dataDir, "brain");
+  const brainRoot = path2.join(dataDir, "brain");
   let dirs = [];
   try {
     dirs = fs.readdirSync(brainRoot);
@@ -565,13 +593,13 @@ function scanBrainDirsFallback(dataDir) {
   return out;
 }
 function computeCatalogSignature(dataDir) {
-  const dbPath = path.join(dataDir, "conversation_summaries.db");
+  const dbPath = path2.join(dataDir, "conversation_summaries.db");
   const walPath = `${dbPath}-wal`;
-  const brainRoot = path.join(dataDir, "brain");
+  const brainRoot = path2.join(dataDir, "brain");
   return `${statSignature(dbPath)}|${statSignature(walPath)}|${statSignature(brainRoot)}`;
 }
 function loadSessionCatalog(dataDir = resolveDataDir()) {
-  const resolvedDir = path.resolve(dataDir);
+  const resolvedDir = path2.resolve(dataDir);
   const sig = computeCatalogSignature(resolvedDir);
   const cached = catalogCache.get(resolvedDir);
   if (cached && cached.sig === sig) {
@@ -585,7 +613,7 @@ function loadSessionCatalog(dataDir = resolveDataDir()) {
     }
     return cached.entries;
   }
-  const dbPath = path.join(resolvedDir, "conversation_summaries.db");
+  const dbPath = path2.join(resolvedDir, "conversation_summaries.db");
   let rawRows = null;
   if (fs.existsSync(dbPath)) {
     rawRows = querySummariesViaNodeSqlite(dbPath);
@@ -600,7 +628,7 @@ function loadSessionCatalog(dataDir = resolveDataDir()) {
     rawRows = scanBrainDirsFallback(resolvedDir);
   }
   const seen = new Set(rawRows.map((r) => r.conversationId));
-  const brainRoot = path.join(resolvedDir, "brain");
+  const brainRoot = path2.join(resolvedDir, "brain");
   try {
     for (const id of fs.readdirSync(brainRoot)) {
       if (id.startsWith(".") || seen.has(id)) continue;
@@ -633,6 +661,8 @@ function loadSessionCatalog(dataDir = resolveDataDir()) {
     const hasSwarm = fs.existsSync(paths.swarmMembersPath) || fs.existsSync(paths.swarmBoardPath);
     const isChild = Boolean(row.parentConversationId) || (row.nestingDepth || 0) > 0;
     return {
+      source: "agy",
+      canonicalId: `agy:${row.conversationId}`,
       sessionId: row.conversationId,
       shortId: row.conversationId.slice(0, 8),
       title: String(row.title || "").trim(),
@@ -815,18 +845,404 @@ function parseTranscriptTurns(transcriptPath, { hydrateFull = false, transcriptF
 }
 
 // src/notes.ts
+var INDEX_START = "<!-- agy-memory:index:start -->";
+var INDEX_END = "<!-- agy-memory:index:end -->";
+var MAX_INDEX_LINES = 150;
+var FRONTMATTER_SCHEMA_VERSION = 1;
+var VALID_NOTE_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+var LOCK_TIMEOUT_MS = 1500;
+var STALE_LOCK_MS = 1e4;
 function getNotesPath(dataDir = resolveDataDir()) {
-  return path2.join(dataDir, "plugin_data", "agy-memory", "notes.json");
+  return path3.join(dataDir, "plugin_data", "agy-memory", "notes.json");
 }
-function loadNotes(dataDir = resolveDataDir()) {
-  const filePath = getNotesPath(dataDir);
-  if (!fs2.existsSync(filePath)) return [];
+function getMemoryDir(dataDir = resolveDataDir()) {
+  return path3.join(dataDir, "plugin_data", "agy-memory", "memory");
+}
+function getMemoryIndexPath(dataDir = resolveDataDir()) {
+  return path3.join(getMemoryDir(dataDir), "MEMORY.md");
+}
+function getTopicsDir(dataDir = resolveDataDir()) {
+  return path3.join(getMemoryDir(dataDir), "topics");
+}
+function isValidNoteId(id) {
+  return VALID_NOTE_ID_RE.test(id);
+}
+function getTopicFilePath(dataDir, validatedId) {
+  if (!isValidNoteId(validatedId)) {
+    throw new Error(`Invalid note ID "${validatedId}". Use 1-64 ASCII letters, digits, '_' or '-' starting with a letter/digit.`);
+  }
+  return path3.join(getTopicsDir(dataDir), `${validatedId}.md`);
+}
+function computeRevision(raw) {
+  return crypto.createHash("sha256").update(raw, "utf8").digest("hex").slice(0, 12);
+}
+function writeTextAtomic(filePath, payload) {
+  const dir = path3.dirname(filePath);
+  fs2.mkdirSync(dir, { recursive: true, mode: 448 });
+  const tmpPath = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
   try {
-    const parsed = JSON.parse(fs2.readFileSync(filePath, "utf8"));
-    return Array.isArray(parsed?.notes) ? parsed.notes : [];
+    fs2.writeFileSync(tmpPath, payload, { encoding: "utf8", mode: 384, flag: "wx" });
+    fs2.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try {
+      fs2.unlinkSync(tmpPath);
+    } catch {
+    }
+    throw err;
+  }
+}
+function sleepSync(ms) {
+  const sab = new SharedArrayBuffer(4);
+  const ia = new Int32Array(sab);
+  Atomics.wait(ia, 0, 0, ms);
+}
+function withNotesLock(dataDir, fn) {
+  const memDir = getMemoryDir(dataDir);
+  fs2.mkdirSync(memDir, { recursive: true, mode: 448 });
+  const lockPath = path3.join(memDir, ".notes.lock");
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  let acquired = false;
+  while (!acquired) {
+    try {
+      const fd = fs2.openSync(lockPath, "wx", 384);
+      fs2.writeSync(fd, `${process.pid}:${Date.now()}
+`);
+      fs2.closeSync(fd);
+      acquired = true;
+    } catch (err) {
+      const code = err?.code;
+      if (code !== "EEXIST") throw err;
+      try {
+        const st = fs2.statSync(lockPath);
+        if (Date.now() - st.mtimeMs > STALE_LOCK_MS) {
+          fs2.unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for notes lock (${lockPath}); retry after concurrent write completes.`);
+      }
+      sleepSync(15);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      fs2.unlinkSync(lockPath);
+    } catch {
+    }
+  }
+}
+function normalizeTagsInput(rawTags) {
+  let list = [];
+  if (Array.isArray(rawTags)) {
+    list = rawTags;
+  } else if (typeof rawTags === "string" && rawTags.trim()) {
+    list = rawTags.split(",");
+  }
+  return [...new Set(list.map((t) => String(t ?? "").trim().toLowerCase()).filter(Boolean))];
+}
+function serializeTopicMarkdown(note) {
+  const fm = [
+    "---",
+    `schema: ${FRONTMATTER_SCHEMA_VERSION}`,
+    `id: ${JSON.stringify(note.id)}`,
+    `topic: ${JSON.stringify(note.topic)}`,
+    `workspace: ${JSON.stringify(note.workspace || "")}`,
+    `tags: ${JSON.stringify(note.tags || [])}`,
+    `sessionId: ${JSON.stringify(note.sessionId || "")}`,
+    `createdAt: ${Number(note.createdAt) || Date.now()}`,
+    `updatedAt: ${Number(note.updatedAt) || Date.now()}`,
+    "---"
+  ].join("\n");
+  return `${fm}
+
+${note.content.replace(/^\n+/, "").trimEnd()}
+`;
+}
+function parseFrontmatterValue(rawVal) {
+  const v = rawVal.trim();
+  if (!v) return { value: "", error: null };
+  if (v.startsWith('"') || v.startsWith("[") || v.startsWith("{")) {
+    try {
+      return { value: JSON.parse(v), error: null };
+    } catch {
+      return { value: null, error: `Malformed JSON-quoted frontmatter value: ${v.slice(0, 60)}` };
+    }
+  }
+  if (v === "true") return { value: true, error: null };
+  if (v === "false") return { value: false, error: null };
+  if (v === "null") return { value: null, error: null };
+  if (/^-?\d+(?:\.\d+)?$/.test(v)) return { value: Number(v), error: null };
+  if (v.startsWith("'") && v.endsWith("'") && v.length >= 2) {
+    return { value: v.slice(1, -1).replace(/''/g, "'"), error: null };
+  }
+  return { value: v, error: null };
+}
+function parseTopicMarkdown(raw, filePath) {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  if (!normalized.startsWith("---\n")) {
+    return { note: null, error: `Malformed frontmatter (missing opening ---) in ${filePath}` };
+  }
+  const endIdx = normalized.indexOf("\n---\n", 4);
+  const endIdxEof = endIdx === -1 && normalized.endsWith("\n---") ? normalized.length - 4 : endIdx;
+  if (endIdxEof < 0) {
+    return { note: null, error: `Malformed frontmatter (missing closing ---) in ${filePath}` };
+  }
+  const headerLines = normalized.slice(4, endIdxEof).split("\n");
+  const rawBody = endIdx >= 0 ? normalized.slice(endIdx + 5) : "";
+  const body = rawBody.replace(/^\n+/, "").trimEnd();
+  const meta = {};
+  for (const line of headerLines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const colon = line.indexOf(":");
+    if (colon <= 0) {
+      return { note: null, error: `Invalid frontmatter line "${trimmed}" in ${filePath}` };
+    }
+    const key = line.slice(0, colon).trim();
+    const parsed = parseFrontmatterValue(line.slice(colon + 1));
+    if (parsed.error) {
+      return { note: null, error: `${parsed.error} in ${filePath}` };
+    }
+    meta[key] = parsed.value;
+  }
+  const schemaVer = Number(meta.schema);
+  if (meta.schema !== void 0 && (!Number.isInteger(schemaVer) || schemaVer !== FRONTMATTER_SCHEMA_VERSION)) {
+    return { note: null, error: `Unsupported frontmatter schema "${String(meta.schema)}" in ${filePath}` };
+  }
+  const id = String(meta.id || "").trim();
+  const topic = String(meta.topic || "").trim();
+  if (!id || !topic) {
+    return { note: null, error: `Missing required frontmatter id/topic in ${filePath}` };
+  }
+  if (!isValidNoteId(id)) {
+    return { note: null, error: `Invalid frontmatter id "${id}" in ${filePath}` };
+  }
+  if (!body.trim()) {
+    return { note: null, error: `Empty note body in ${filePath}` };
+  }
+  let stMtime = Date.now();
+  try {
+    stMtime = Math.round(fs2.statSync(filePath).mtimeMs);
+  } catch {
+  }
+  const note = {
+    id,
+    topic,
+    content: body,
+    workspace: String(meta.workspace || "").trim(),
+    tags: normalizeTagsInput(meta.tags),
+    sessionId: String(meta.sessionId || "").trim(),
+    createdAt: Number(meta.createdAt) || stMtime,
+    updatedAt: Number(meta.updatedAt) || stMtime,
+    filePath,
+    revision: computeRevision(raw)
+  };
+  return { note, error: null };
+}
+function rebuildMemoryIndexFile(dataDir, notes) {
+  const indexPath = getMemoryIndexPath(dataDir);
+  const sorted = [...notes].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  const indexRows = [
+    INDEX_START,
+    `<!-- Auto-maintained index (${sorted.length} notes; topics/*.md files are authoritative) -->`
+  ];
+  const maxRows = Math.max(10, MAX_INDEX_LINES - 12);
+  for (const n of sorted.slice(0, maxRows)) {
+    const ws = n.workspace ? ` \xB7 ${formatWorkspaceLabel(n.workspace)}` : "";
+    const tags = n.tags.length > 0 ? ` [${n.tags.join(", ")}]` : "";
+    const preview = n.content.replace(/\s+/g, " ").trim();
+    const shortPrev = preview.length > 100 ? `${safeSliceChars(preview, 99)}\u2026` : preview;
+    const relName = n.filePath ? path3.basename(n.filePath) : `${n.id}.md`;
+    indexRows.push(`- **[${n.id}] ${n.topic}**${tags}${ws} \u2192 \`topics/${relName}\` \u2014 ${shortPrev}`);
+  }
+  if (sorted.length > maxRows) {
+    indexRows.push(`- \u2026 (${sorted.length - maxRows} additional note(s) in \`topics/\`; use \`recall_notes\` to query all)`);
+  }
+  indexRows.push(INDEX_END);
+  const managedBlock = indexRows.join("\n");
+  let finalDoc = `# agy-memory Index
+
+Add personal notes above or below the managed markers; topic files in \`topics/\` are authoritative.
+
+${managedBlock}
+`;
+  if (fs2.existsSync(indexPath)) {
+    try {
+      const existing = fs2.readFileSync(indexPath, "utf8").replace(/\r\n/g, "\n");
+      const sIdx = existing.indexOf(INDEX_START);
+      const eIdx = existing.indexOf(INDEX_END);
+      if (sIdx >= 0 && eIdx > sIdx) {
+        finalDoc = `${existing.slice(0, sIdx)}${managedBlock}${existing.slice(eIdx + INDEX_END.length)}`;
+      } else if (existing.trim()) {
+        finalDoc = `${existing.trimEnd()}
+
+${managedBlock}
+`;
+      }
+    } catch {
+    }
+  }
+  writeTextAtomic(indexPath, finalDoc);
+}
+function sanitizeLegacyNoteId(rawId) {
+  const trimmed = String(rawId || "").trim();
+  if (isValidNoteId(trimmed)) return trimmed;
+  const hash = crypto.createHash("sha256").update(trimmed || crypto.randomBytes(8).toString("hex")).digest("hex").slice(0, 8);
+  const prefix = trimmed.replace(/[^a-zA-Z0-9_-]/g, "").replace(/^[^a-zA-Z0-9]+/, "").slice(0, 48);
+  return prefix ? `${prefix}-${hash}` : `note-${hash}`;
+}
+function readTopicsFromDisk(dataDir, warnings) {
+  const topicsDir = getTopicsDir(dataDir);
+  if (!fs2.existsSync(topicsDir)) return [];
+  const notes = [];
+  const seenIds = /* @__PURE__ */ new Map();
+  let entries = [];
+  try {
+    entries = fs2.readdirSync(topicsDir).filter((f) => f.endsWith(".md") && !f.startsWith(".")).sort();
   } catch {
     return [];
   }
+  for (const name of entries) {
+    const filePath = path3.join(topicsDir, name);
+    try {
+      const raw = fs2.readFileSync(filePath, "utf8");
+      const { note, error } = parseTopicMarkdown(raw, filePath);
+      if (error || !note) {
+        warnings.push(error || `Unreadable topic note: ${filePath}`);
+        continue;
+      }
+      if (seenIds.has(note.id)) {
+        warnings.push(`Duplicate note ID "${note.id}" in ${filePath} (already defined in ${seenIds.get(note.id)})`);
+        continue;
+      }
+      seenIds.set(note.id, filePath);
+      notes.push(note);
+    } catch {
+      warnings.push(`Could not read topic note: ${filePath}`);
+    }
+  }
+  return notes;
+}
+function loadLegacyJsonNotesReadOnly(dataDir) {
+  const filePath = getNotesPath(dataDir);
+  const warnings = [];
+  if (!fs2.existsSync(filePath)) return { notes: [], warnings };
+  try {
+    const parsed = JSON.parse(fs2.readFileSync(filePath, "utf8"));
+    const notes = Array.isArray(parsed?.notes) ? parsed.notes : [];
+    return { notes, warnings };
+  } catch {
+    warnings.push(`Malformed legacy notes file preserved untouched: ${filePath}`);
+    return { notes: [], warnings };
+  }
+}
+function maybeMigrateLegacyNotesJson(dataDir, warnings) {
+  const legacyPath = getNotesPath(dataDir);
+  if (!fs2.existsSync(legacyPath)) return;
+  const markerPath = path3.join(getMemoryDir(dataDir), ".migrated_v1_json");
+  if (fs2.existsSync(markerPath)) return;
+  withNotesLock(dataDir, () => {
+    if (fs2.existsSync(markerPath)) return;
+    let legacyNotes = [];
+    try {
+      const parsed = JSON.parse(fs2.readFileSync(legacyPath, "utf8"));
+      if (!Array.isArray(parsed?.notes)) {
+        warnings.push(`Legacy ${legacyPath} has invalid structure; preserved untouched.`);
+        return;
+      }
+      legacyNotes = parsed.notes;
+    } catch {
+      warnings.push(`Legacy ${legacyPath} could not be parsed as JSON; preserved untouched.`);
+      return;
+    }
+    const topicsDir = getTopicsDir(dataDir);
+    fs2.mkdirSync(topicsDir, { recursive: true, mode: 448 });
+    let allVerified = true;
+    let migratedAny = false;
+    for (let i = 0; i < legacyNotes.length; i += 1) {
+      const raw = legacyNotes[i];
+      const topic = String(raw.topic || "").trim();
+      const content = String(raw.content || "").replace(/^\n+/, "").trimEnd();
+      if (!topic || !content.trim()) {
+        allVerified = false;
+        warnings.push(`Legacy note #${i + 1} has empty topic/content; legacy notes.json retained for inspection.`);
+        continue;
+      }
+      const id = sanitizeLegacyNoteId(String(raw.id || ""));
+      const dst = getTopicFilePath(dataDir, id);
+      if (fs2.existsSync(dst)) {
+        try {
+          const existingParsed = parseTopicMarkdown(fs2.readFileSync(dst, "utf8"), dst);
+          if (existingParsed.note && existingParsed.note.id === id && existingParsed.note.topic === topic && existingParsed.note.content === content) {
+            continue;
+          }
+        } catch {
+        }
+        allVerified = false;
+        warnings.push(`Migration collision for legacy note "${id}" (${dst} already exists with different content); preserved untouched.`);
+        continue;
+      }
+      const normalized = {
+        id,
+        topic,
+        content,
+        workspace: String(raw.workspace || "").trim(),
+        tags: normalizeTagsInput(raw.tags),
+        sessionId: String(raw.sessionId || "").trim(),
+        createdAt: Number(raw.createdAt) || Date.now(),
+        updatedAt: Number(raw.updatedAt) || Date.now()
+      };
+      writeTextAtomic(dst, serializeTopicMarkdown(normalized));
+      const verify = parseTopicMarkdown(fs2.readFileSync(dst, "utf8"), dst);
+      if (!verify.note || verify.note.id !== normalized.id || verify.note.topic !== normalized.topic || verify.note.content !== normalized.content) {
+        allVerified = false;
+        warnings.push(`Migration verification failed for note ${id}; legacy notes.json retained.`);
+      } else {
+        migratedAny = true;
+      }
+    }
+    if (migratedAny || fs2.existsSync(topicsDir)) {
+      const freshWarnings = [];
+      const currentNotes = readTopicsFromDisk(dataDir, freshWarnings);
+      if (currentNotes.length > 0 && !fs2.existsSync(getMemoryIndexPath(dataDir))) {
+        rebuildMemoryIndexFile(dataDir, currentNotes);
+      }
+    }
+    if (allVerified) {
+      writeTextAtomic(markerPath, `migrated_at=${(/* @__PURE__ */ new Date()).toISOString()}
+count=${legacyNotes.length}
+`);
+    }
+  });
+}
+function loadNotesWithDiagnostics(dataDir = resolveDataDir(), opts = {}) {
+  const warnings = [];
+  const topicsDir = getTopicsDir(dataDir);
+  const memoryIndexPath = getMemoryIndexPath(dataDir);
+  if (opts.readOnly) {
+    const topicNotes = readTopicsFromDisk(dataDir, warnings);
+    if (topicNotes.length > 0 || fs2.existsSync(topicsDir)) {
+      return { notes: topicNotes, warnings, memoryIndexPath, topicsDir };
+    }
+    const legacy = loadLegacyJsonNotesReadOnly(dataDir);
+    return {
+      notes: legacy.notes,
+      warnings: [...warnings, ...legacy.warnings],
+      memoryIndexPath: getNotesPath(dataDir),
+      topicsDir
+    };
+  }
+  maybeMigrateLegacyNotesJson(dataDir, warnings);
+  const notes = readTopicsFromDisk(dataDir, warnings);
+  return { notes, warnings, memoryIndexPath, topicsDir };
+}
+function loadNotes(dataDir = resolveDataDir(), opts = {}) {
+  return loadNotesWithDiagnostics(dataDir, opts).notes;
 }
 
 // src/snapshot.ts
@@ -868,14 +1284,14 @@ function buildSessionStartSnapshot(payload = {}, dataDir = resolveDataDir()) {
     }
   }
   const recent = [...substantive, ...minor].slice(0, 5);
-  const notes = loadNotes(dataDir).filter((n) => noteWorkspaceMatches(n.workspace, primaryWs)).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 5);
+  const notes = loadNotes(dataDir, { readOnly: true }).filter((n) => noteWorkspaceMatches(n.workspace, primaryWs)).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 5);
   if (recent.length === 0 && notes.length === 0 && !currentId) {
     return "";
   }
   const lines = ["[agy-memory] Local cross-conversation context (read-only snapshot):"];
   if (currentId) {
     const shortCur = currentId.slice(0, 8);
-    lines.push(`Current session: ${shortCur} (pass excludeSessionId="${shortCur}" when searching past sessions)`);
+    lines.push(`Current session: ${shortCur} (pass excludeSessionId="agy:${currentId}" when searching past sessions)`);
   }
   if (recent.length > 0) {
     const wsLabel = primaryWs ? formatWorkspaceLabel(primaryWs) : "";
@@ -899,14 +1315,16 @@ function buildSessionStartSnapshot(payload = {}, dataDir = resolveDataDir()) {
     lines.push("Pinned notes:");
     for (const n of notes) {
       const text = String(n.content || "").replace(/\s+/g, " ").trim();
-      const clip = text.length > 180 ? `${safeSliceChars(text, 179)}\u2026` : text;
+      const clip = text.length > 140 ? `${safeSliceChars(text, 139)}\u2026` : text;
       const tagPart = Array.isArray(n.tags) && n.tags.length > 0 ? ` [${n.tags.join(", ")}]` : "";
       lines.push(`- [${n.id}] ${n.topic}${tagPart}: ${clip}`);
     }
   }
-  lines.push(
-    'Use mcp_agy-memory_memory_search_sessions / mcp_agy-memory_memory_read_session(mode="digest") when past session details are needed.'
-  );
+  const extAvail = [];
+  if (fs3.existsSync(resolveCodexDir())) extAvail.push("codex");
+  if (fs3.existsSync(resolveClaudeDir())) extAvail.push("claude");
+  const extHint = extAvail.length > 0 ? ` Cross-CLI sources: ${extAvail.join(", ")} (source="all").` : "";
+  lines.push(`Use agy-memory tools when needed.${extHint}`);
   return truncateUtf8(lines.join("\n"), 1650, 1800);
 }
 
