@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import { checkScanBudget, createScanBudget } from "./adapters.js";
 import {
   clampMaxChars,
   formatRelativeTime,
@@ -8,25 +9,29 @@ import {
   getSearchableSessionDoc,
   isSessionDocCached,
   listSessionArtifactFiles,
-  loadSessionCatalog,
+  loadFederatedCatalog,
   matchesSessionId,
   normalizeFsPath,
   parseQueryTokens,
+  parseSourceFilter,
   resolveDataDir,
+  resolveSessionEntry,
   safeSliceChars,
+  splitCanonicalRef,
   truncateUtf8,
   workspaceMatches,
 } from "./store.js";
-import type { SessionEntry, ToolResult } from "./types.js";
+import { runErrorHistorySearch, runFileHistorySearch } from "./trace.js";
+import type { ScanBudget, SessionEntry, SourceFilter, ToolResult } from "./types.js";
 
 const RG_CANDIDATES =
   process.platform === "win32"
     ? ["rg", "rg.exe"]
     : ["rg", "/usr/bin/rg", "/usr/local/bin/rg", "/opt/homebrew/bin/rg"];
 const VALID_SCOPES = new Set(["all", "user", "assistant", "artifacts", "swarm"]);
+const VALID_SEARCH_MODES = new Set(["text", "file_history", "error_history"]);
 const IN_FLIGHT_WINDOW_MS = 180 * 1000;
 const JSON_ESCAPED_CHAR_RE = /["\\<>&\n\r\t]/;
-const LOOKAROUND_RE = /\(\?[=!<]/;
 const CJK_CHAR_RE = /[\u3400-\u9fff\uf900-\ufaff]/g;
 
 interface ParsedQuery {
@@ -141,26 +146,26 @@ function collectEligibleRgFiles(
   const files: string[] = [];
   const fileToSession = new Map<string, string>();
 
-  const registerFile = (filePath: string, sessionId: string): void => {
+  const registerFile = (filePath: string, canonicalId: string): void => {
     files.push(filePath);
-    fileToSession.set(normalizeFsPath(filePath), sessionId);
+    fileToSession.set(normalizeFsPath(filePath), canonicalId);
   };
 
   for (const entry of entries) {
     if (wantTranscript && entry.hasTranscript) {
-      registerFile(entry.paths.transcriptPath, entry.sessionId);
-      if (fs.existsSync(entry.paths.transcriptFullPath)) {
-        registerFile(entry.paths.transcriptFullPath, entry.sessionId);
+      registerFile(entry.paths.transcriptPath, entry.canonicalId);
+      if (entry.paths.transcriptFullPath && fs.existsSync(entry.paths.transcriptFullPath)) {
+        registerFile(entry.paths.transcriptFullPath, entry.canonicalId);
       }
     }
-    if (wantArtifacts) {
+    if (wantArtifacts && entry.source === "agy") {
       const arts = listSessionArtifactFiles(entry.paths.brainDir, { includeMeta: false });
       for (const art of arts) {
-        registerFile(art.path, entry.sessionId);
+        registerFile(art.path, entry.canonicalId);
       }
     }
-    if (wantSwarm && entry.hasSwarm && fs.existsSync(entry.paths.swarmBoardPath)) {
-      registerFile(entry.paths.swarmBoardPath, entry.sessionId);
+    if (wantSwarm && entry.hasSwarm && entry.paths.swarmBoardPath && fs.existsSync(entry.paths.swarmBoardPath)) {
+      registerFile(entry.paths.swarmBoardPath, entry.canonicalId);
     }
   }
   return { files, fileToSession };
@@ -312,6 +317,7 @@ function scanSessionDoc(
     maxSnippets,
     now,
     skipInFlightSelfPrompt,
+    budget,
   }: {
     scope: string;
     terms: string[];
@@ -319,6 +325,7 @@ function scanSessionDoc(
     maxSnippets: number;
     now: number;
     skipInFlightSelfPrompt: boolean;
+    budget?: ScanBudget;
   },
 ): { hit: SessionSearchHit | null; skippedInFlight: boolean } {
   const sessionTermsFound = new Set<string>();
@@ -338,7 +345,7 @@ function scanSessionDoc(
     }
   }
 
-  const doc = getSearchableSessionDoc(entry, { includeFullTranscript: true });
+  const doc = getSearchableSessionDoc(entry, { includeFullTranscript: true, budget });
   const isRecentlyActive =
     doc.latestTranscriptMtimeMs > 0 && now - doc.latestTranscriptMtimeMs < IN_FLIGHT_WINDOW_MS;
 
@@ -450,6 +457,8 @@ function scanSessionDoc(
 export interface SearchSessionsOptions {
   dataDir?: string;
   query?: string;
+  mode?: string;
+  source?: string;
   scope?: string;
   regex?: boolean;
   workspace?: string;
@@ -460,12 +469,16 @@ export interface SearchSessionsOptions {
   maxSessions?: number;
   maxSnippetsPerSession?: number;
   maxChars?: number;
+  maxScanBytes?: number;
+  maxScanMs?: number;
 }
 
 export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResult {
   const {
     dataDir = resolveDataDir(),
     query = "",
+    mode = "text",
+    source = "agy",
     scope = "all",
     regex: isRegex = false,
     workspace = "",
@@ -476,7 +489,83 @@ export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResu
     maxSessions = 10,
     maxSnippetsPerSession = 3,
     maxChars = 8200,
+    maxScanBytes,
+    maxScanMs,
   } = opts;
+
+  const safeMode = String(mode || "text").trim().toLowerCase();
+  if (!VALID_SEARCH_MODES.has(safeMode)) {
+    return {
+      text: `Error: Invalid mode "${mode}". Expected one of: text, file_history, error_history.`,
+      isError: true,
+    };
+  }
+
+  const parsedSource = parseSourceFilter(source);
+  if (parsedSource.error) {
+    return { text: parsedSource.error, isError: true };
+  }
+
+  const targetSessionRef = String(sessionId || "").trim();
+  const explicitTargetSrc = targetSessionRef ? splitCanonicalRef(targetSessionRef).source : null;
+  const effectiveSource: SourceFilter = explicitTargetSrc || parsedSource.source;
+
+  const safeMaxSessions = Math.max(1, Math.min(25, Number(maxSessions) || 10));
+  const safeMaxSnippets = Math.max(1, Math.min(8, Number(maxSnippetsPerSession) || 3));
+  const safeMaxChars = clampMaxChars(maxChars, 8200);
+
+  const { entries: catalog, coverageLabel } = loadFederatedCatalog(dataDir, effectiveSource);
+  const now = Date.now();
+  const minMs = sinceDays > 0 ? now - sinceDays * 24 * 3600 * 1000 : 0;
+
+  // Enforce strict single-session resolution (rejecting ambiguous prefixes identically to read_session)
+  let eligible: SessionEntry[];
+  if (targetSessionRef) {
+    const resolved = resolveSessionEntry(dataDir, targetSessionRef, catalog, effectiveSource);
+    if (!resolved.entry) {
+      return { text: `Error: ${resolved.error || `No conversation matched "${targetSessionRef}".`}`, isError: true };
+    }
+    const s = resolved.entry;
+    const excluded =
+      (excludeSessionId && matchesSessionId(s.sessionId, excludeSessionId, s.source)) ||
+      (minMs > 0 && s.updatedMs < minMs) ||
+      !workspaceMatches(s.workspaces, workspace);
+    eligible = excluded ? [] : [s];
+  } else {
+    eligible = catalog.filter((s) => {
+      if (!includeChildren && s.isChild) return false;
+      if (excludeSessionId && matchesSessionId(s.sessionId, excludeSessionId, s.source)) return false;
+      if (minMs > 0 && s.updatedMs < minMs) return false;
+      if (!workspaceMatches(s.workspaces, workspace)) return false;
+      return true;
+    });
+  }
+
+  // Dispatch deterministic verbatim trace modes directly
+  if (safeMode === "file_history") {
+    return runFileHistorySearch({
+      eligible,
+      query,
+      sourceCoverage: coverageLabel,
+      maxSessions: safeMaxSessions,
+      maxChars: safeMaxChars,
+      maxScanBytes,
+      maxScanMs,
+      workspace,
+    });
+  }
+  if (safeMode === "error_history") {
+    return runErrorHistorySearch({
+      eligible,
+      query,
+      sourceCoverage: coverageLabel,
+      maxSessions: safeMaxSessions,
+      maxChars: safeMaxChars,
+      maxScanBytes,
+      maxScanMs,
+      workspace,
+    });
+  }
 
   const safeScope = String(scope || "all").trim().toLowerCase();
   if (!VALID_SCOPES.has(safeScope)) {
@@ -492,57 +581,39 @@ export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResu
   }
   const { terms, regex } = parsed;
 
-  const safeMaxSessions = Math.max(1, Math.min(25, Number(maxSessions) || 10));
-  const safeMaxSnippets = Math.max(1, Math.min(8, Number(maxSnippetsPerSession) || 3));
-  const safeMaxChars = clampMaxChars(maxChars, 8200);
+  // Start budget clock BEFORE prefilter so rg I/O is accounted for cleanly
+  const budget = createScanBudget(maxScanBytes, maxScanMs);
 
-  const catalog = loadSessionCatalog(dataDir);
-  const now = Date.now();
-  const minMs = sinceDays > 0 ? now - sinceDays * 24 * 3600 * 1000 : 0;
-  const targetSessionRef = String(sessionId || "").trim();
-
-  const eligible = catalog.filter((s) => {
-    if (!includeChildren && !targetSessionRef && s.isChild) return false;
-    if (targetSessionRef && !matchesSessionId(s.sessionId, targetSessionRef)) return false;
-    if (excludeSessionId && matchesSessionId(s.sessionId, excludeSessionId)) return false;
-    if (minMs > 0 && s.updatedMs < minMs) return false;
-    if (!workspaceMatches(s.workspaces, workspace)) return false;
-    return true;
-  });
-
-  if (targetSessionRef && eligible.length === 0) {
-    return {
-      text: `Error: No local conversation found matching sessionId "${targetSessionRef}".`,
-      isError: true,
-    };
-  }
-
-  // Decide which sessions need scanning: cached sessions scan in <2ms; uncached sessions use smart rg pre-filter
+  // Decide which sessions need scanning:
+  // - ALWAYS bypass raw-file rg prefilter for regex queries (rg sees serialized JSON lines, JS sees decoded text).
+  // - For literal queries, keep rg prefilter only when tokens cannot be JSON-escaped differently, and preserve
+  //   title/preview hits and artifact-filename-only hits in memory.
   const hasJsonSpecial = terms.some((t) => JSON_ESCAPED_CHAR_RE.test(t));
-  const hasLookaround = Boolean(regex) && LOOKAROUND_RE.test(String(query));
   const uncachedEntries = eligible.filter((s) => !isSessionDocCached(s));
 
   let toScan = eligible;
-  if (!targetSessionRef && uncachedEntries.length > 0 && !hasJsonSpecial && !hasLookaround) {
+  if (!targetSessionRef && !regex && uncachedEntries.length > 0 && !hasJsonSpecial) {
     let remainingUncached = uncachedEntries;
-    const seedList = regex ? [String(query)] : rankSeedTerms(terms).slice(0, 3);
+    const seedList = rankSeedTerms(terms).slice(0, 3);
     let rgFailed = false;
+    const checkArtifactNames = safeScope === "all" || safeScope === "artifacts";
 
     for (const seedTerm of seedList) {
       if (remainingUncached.length === 0) break;
-      const rgMatchedIds = findMatchingSessionsWithRg(remainingUncached, seedTerm, Boolean(regex), safeScope);
+      const rgMatchedIds = findMatchingSessionsWithRg(remainingUncached, seedTerm, false, safeScope);
       if (!(rgMatchedIds instanceof Set)) {
         rgFailed = true;
         break;
       }
       remainingUncached = remainingUncached.filter((s) => {
-        if (rgMatchedIds.has(s.sessionId)) return true;
+        if (rgMatchedIds.has(s.canonicalId)) return true;
         if (safeScope === "all") {
-          const titleText = `${s.title} ${s.preview}`.trim();
-          const lowTitle = titleText.toLowerCase();
-          if (regex ? regex.test(titleText) : lowTitle.includes(seedTerm)) {
-            return true;
-          }
+          const lowTitle = `${s.title} ${s.preview}`.trim().toLowerCase();
+          if (lowTitle.includes(seedTerm)) return true;
+        }
+        if (checkArtifactNames && s.source === "agy") {
+          const arts = listSessionArtifactFiles(s.paths.brainDir, { includeMeta: false });
+          if (arts.some((a) => a.name.toLowerCase().includes(seedTerm))) return true;
         }
         return false;
       });
@@ -550,8 +621,8 @@ export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResu
     }
 
     if (!rgFailed) {
-      const keptUncached = new Set(remainingUncached.map((s) => s.sessionId));
-      toScan = eligible.filter((s) => isSessionDocCached(s) || keptUncached.has(s.sessionId));
+      const keptUncached = new Set(remainingUncached.map((s) => s.canonicalId));
+      toScan = eligible.filter((s) => isSessionDocCached(s) || keptUncached.has(s.canonicalId));
     }
   }
 
@@ -560,6 +631,8 @@ export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResu
   let skippedInFlightCount = 0;
 
   for (const entry of toScan) {
+    if (!checkScanBudget(budget)) break;
+    budget.sessionsScanned += 1;
     const { hit, skippedInFlight } = scanSessionDoc(entry, {
       scope: safeScope,
       terms,
@@ -567,6 +640,7 @@ export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResu
       maxSnippets: safeMaxSnippets,
       now,
       skipInFlightSelfPrompt,
+      budget,
     });
     if (skippedInFlight) skippedInFlightCount += 1;
     if (hit) results.push(hit);
@@ -574,6 +648,9 @@ export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResu
 
   results.sort((a, b) => b.score - a.score || b.entry.updatedMs - a.entry.updatedMs);
   const top = results.slice(0, safeMaxSessions);
+  const incompleteNote = budget.incomplete
+    ? `INCOMPLETE SCAN (${budget.sessionsScanned}/${toScan.length} candidates, ${(budget.bytesRead / (1024 * 1024)).toFixed(1)} MB; ${budget.reason}; narrow with workspace/sinceDays — do NOT treat 0-match as authoritative).`
+    : "";
 
   if (top.length === 0) {
     const scopeLabel = safeScope === "all" ? "transcripts, artifacts, and swarm boards" : safeScope;
@@ -582,23 +659,28 @@ export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResu
     if (targetSessionRef) filters.push(`sessionId="${targetSessionRef}"`);
     if (skippedInFlightCount > 0) filters.push("excluded active in-flight prompt");
     const filterSuffix = filters.length > 0 ? `; ${filters.join(", ")}` : "";
+    const statusLine = incompleteNote
+      ? `\n${incompleteNote}`
+      : `\nComplete scan (${eligible.length} eligible session(s), ${coverageLabel}).\nNote: text mode searches user/assistant replies, artifacts, and Swarm only; for failed commands/exit codes or tool file edits, try mode="error_history" or mode="file_history".`;
     return {
-      text: `No past conversations matched "${query}" (searched ${eligible.length} session(s) across ${scopeLabel}${filterSuffix}).`,
+      text: `No past conversations matched "${query}" (searched ${eligible.length} session(s) [${coverageLabel}] across ${scopeLabel}${filterSuffix}).${statusLine}`,
       isError: false,
     };
   }
 
   const lines = [
-    `Search "${query}" — ${results.length} matching conversation(s) (showing top ${top.length}, scope=${safeScope}${targetSessionRef ? `, session=${targetSessionRef}` : ""}):`,
+    `Search "${query}" — ${results.length} matching conversation(s) (showing top ${top.length}, scope=${safeScope}, sources=${coverageLabel}${targetSessionRef ? `, session=${targetSessionRef}` : ""}):`,
   ];
+  if (incompleteNote) lines.push(incompleteNote);
 
   for (const r of top) {
     const e = r.entry;
     const wsName = e.workspaces.length > 0 ? formatWorkspaceLabel(e.workspaces[0] ?? "") : "";
+    const dispId = e.source === "agy" ? e.shortId : `${e.source}:${e.shortId}`;
     lines.push(
-      `\n### ${e.shortId} — ${e.title || "(untitled)"} (${formatShortDate(e.updatedMs)}, ${formatRelativeTime(e.updatedMs, now)}${wsName ? `, ${wsName}` : ""})`,
+      `\n### ${dispId} — ${e.title || "(untitled)"} (${formatShortDate(e.updatedMs)}, ${formatRelativeTime(e.updatedMs, now)}${wsName ? `, ${wsName}` : ""})`,
     );
-    lines.push(`ID: ${e.sessionId}`);
+    lines.push(`ID: ${e.source === "agy" ? e.sessionId : e.canonicalId}`);
     if (r.snippets.length === 0 && r.titleMatched) {
       lines.push(`- [title] ${e.title || e.preview}`);
     } else {

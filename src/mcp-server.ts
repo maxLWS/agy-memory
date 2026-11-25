@@ -3,7 +3,7 @@ import { executeToolResult, TOOL_DEFINITIONS } from "./tools.js";
 
 const SERVER_INFO = {
   name: "agy-memory",
-  version: "0.2.0",
+  version: "0.3.0",
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS = new Set([
@@ -345,6 +345,7 @@ function runCliMode(argv: string[]): void {
     const { text, isError } = executeToolResult(
       "list_sessions",
       {
+        source: flagString(flags, "source") || "agy",
         workspace: flagString(flags, "workspace"),
         query: positional.slice(1).join(" ") || flagString(flags, "query"),
         includeChildren: Boolean(flags["include-children"]),
@@ -367,6 +368,8 @@ function runCliMode(argv: string[]): void {
       "search_sessions",
       {
         query,
+        mode: flagString(flags, "mode") || "text",
+        source: flagString(flags, "source") || "agy",
         scope: flagString(flags, "scope") || "all",
         regex: Boolean(flags.regex),
         sessionId: flagString(flags, "session"),
@@ -391,6 +394,7 @@ function runCliMode(argv: string[]): void {
       "read_session",
       {
         sessionId,
+        source: flagString(flags, "source") || "agy",
         mode: flagString(flags, "mode") || "digest",
         startStep: parseOptionalInt(flags["start-step"]),
         endStep: parseOptionalInt(flags["end-step"]),
@@ -466,9 +470,9 @@ function runCliMode(argv: string[]): void {
   process.stdout.write(
     [
       `agy-memory v${SERVER_INFO.version} CLI usage:`,
-      "  node dist/mcp-server.mjs --cli list [--workspace <dir>] [--min-steps 5] [--exclude <id>] [--limit 15] [query]",
-      "  node dist/mcp-server.mjs --cli search [--scope all|user|assistant|artifacts|swarm] [--session <id>] [--exclude <id>] [--workspace <dir>] <query>",
-      "  node dist/mcp-server.mjs --cli read <sessionId> [--mode digest|turns|artifacts|swarm] [--tail 20] [--start-seq N] [--end-seq N] [--query <q>] [--char-offset N]",
+      "  node dist/mcp-server.mjs --cli list [--source agy|codex|claude|all] [--workspace <dir>] [--min-steps 5] [--exclude <id>] [--limit 15] [query]",
+      "  node dist/mcp-server.mjs --cli search [--mode text|file_history|error_history] [--source agy|codex|claude|all] [--scope all|user|assistant|artifacts|swarm] [--session <id>] [--exclude <id>] [--workspace <dir>] <query>",
+      "  node dist/mcp-server.mjs --cli read <sessionId> [--source agy|codex|claude|all] [--mode digest|turns|artifacts|swarm] [--tail 20] [--start-seq N] [--end-seq N] [--query <q>] [--char-offset N]",
       "  node dist/mcp-server.mjs --cli note-save --topic <title> --content <text> [--workspace <dir>] [--tags a,b]",
       "  node dist/mcp-server.mjs --cli note-recall [query] [--workspace <dir>] [--tag <tag>]",
       "  node dist/mcp-server.mjs --cli stats [--recent 50] [--json]",

@@ -9,177 +9,79 @@ export interface McpToolDefinition {
   inputSchema: Record<string, unknown>;
 }
 
+const SOURCE_ENUM = ["agy", "codex", "claude", "all"];
+
 export const TOOL_DEFINITIONS: McpToolDefinition[] = [
   {
     name: "list_sessions",
-    description:
-      "List recent local Antigravity conversations (titles, IDs, workspaces, step counts, substantive latest prompt, swarm/artifact badges). Fast read-only catalog query, newest first.",
+    description: "List recent local conversations (read-only catalog, newest first).",
     inputSchema: {
       type: "object",
       properties: {
-        workspace: {
-          type: "string",
-          description: "Optional workspace path (exact/child match) or folder name filter.",
-        },
-        query: {
-          type: "string",
-          description: "Optional multi-word filter (supports quoted phrases) matched against title, preview, ID, workspace, and last user message.",
-        },
-        includeChildren: {
-          type: "boolean",
-          description: "Include subagent and Swarm worker child conversations (default false).",
-        },
-        excludeSessionId: {
-          type: "string",
-          description: "Optional conversation ID or prefix (>=4 chars, or comma-separated list) to exclude (e.g. current session).",
-        },
-        sinceHours: {
-          type: "number",
-          description: "Optional recency window in hours.",
-        },
-        minSteps: {
-          type: "integer",
-          description: "Optional minimum step count to filter out tiny/probe sessions (e.g. 5).",
-        },
-        limit: {
-          type: "integer",
-          description: "Maximum sessions to return (1..50, default 15).",
-        },
-        maxChars: {
-          type: "integer",
-          description: "Output character cap (200..8200, default 8200).",
-        },
+        source: { type: "string", enum: SOURCE_ENUM, description: "Source (default agy)." },
+        workspace: { type: "string", description: "Workspace filter." },
+        query: { type: "string", description: "Filter title, ID, workspace, prompt." },
+        includeChildren: { type: "boolean", description: "Include child workers." },
+        excludeSessionId: { type: "string", description: "ID/prefix list (e.g. agy:<id>)." },
+        sinceHours: { type: "number", description: "Hours lookback." },
+        minSteps: { type: "integer", description: "Min steps (e.g. 5)." },
+        limit: { type: "integer", description: "Max rows (1..50)." },
+        maxChars: { type: "integer", description: "Char cap (200..8200)." },
       },
     },
   },
   {
     name: "search_sessions",
     description:
-      "Search across past local Antigravity conversations (CJK and English supported) covering user prompts, assistant replies (including hydrated full responses), Markdown artifacts, and Swarm boards. Returns ranked, term-diverse excerpts with session IDs, step numbers, and artifact paths.",
+      "Search past conversations (text, file_history, or error_history). Text searches replies/artifacts/Swarm (+Codex/Claude); for failed commands, test failures, or exit codes use mode='error_history' even when querying a filename.",
     inputSchema: {
       type: "object",
       properties: {
-        query: {
+        query: { type: "string", description: "Keywords/phrase, regex, file path, or error text." },
+        mode: {
           type: "string",
-          description: "Search keywords (multi-word AND, supports quoted phrases) or regex when regex=true.",
+          enum: ["text", "file_history", "error_history"],
+          description:
+            "text (default: replies/artifacts/swarm), file_history (file edit vs read history, agy), or error_history (failed commands, test failures, or exit codes, agy — use error_history even when querying a filename).",
         },
-        scope: {
-          type: "string",
-          enum: ["all", "user", "assistant", "artifacts", "swarm"],
-          description: "Where to search (default 'all'; strictly scoped when not 'all').",
-        },
-        regex: {
-          type: "boolean",
-          description: "Treat query as a case-insensitive regular expression (default false).",
-        },
-        sessionId: {
-          type: "string",
-          description: "Optional full UUID or prefix (>=4 chars) to search within a single specific conversation.",
-        },
-        workspace: {
-          type: "string",
-          description: "Optional workspace path (exact/child match) or folder name filter.",
-        },
-        includeChildren: {
-          type: "boolean",
-          description: "Include subagent/Swarm worker child conversations (default false).",
-        },
-        excludeSessionId: {
-          type: "string",
-          description: "Optional conversation ID or prefix (>=4 chars, or comma-separated list) to exclude (e.g. current session).",
-        },
-        sinceDays: {
-          type: "number",
-          description: "Optional recency window in days.",
-        },
-        maxSessions: {
-          type: "integer",
-          description: "Maximum matching conversations to return (1..25, default 10).",
-        },
-        maxSnippetsPerSession: {
-          type: "integer",
-          description: "Maximum term-diverse excerpts per conversation (1..8, default 3).",
-        },
-        maxChars: {
-          type: "integer",
-          description: "Output character cap (200..8200, default 8200).",
-        },
+        source: { type: "string", enum: SOURCE_ENUM, description: "Source (default agy; all=agy+codex+claude)." },
+        scope: { type: "string", enum: ["all", "user", "assistant", "artifacts", "swarm"], description: "Text scope." },
+        regex: { type: "boolean", description: "Regex in text mode." },
+        sessionId: { type: "string", description: "Single session ID/prefix (or codex:<id>)." },
+        workspace: { type: "string", description: "Workspace filter." },
+        includeChildren: { type: "boolean", description: "Include child workers." },
+        excludeSessionId: { type: "string", description: "ID/prefix list (e.g. agy:<id>)." },
+        sinceDays: { type: "number", description: "Days lookback." },
+        maxSessions: { type: "integer", description: "Max sessions (1..25)." },
+        maxSnippetsPerSession: { type: "integer", description: "Excerpts/session (1..8)." },
+        maxChars: { type: "integer", description: "Char cap (200..8200)." },
       },
       required: ["query"],
     },
   },
   {
     name: "read_session",
-    description:
-      "Read a specific past conversation by full UUID or prefix (>=4 chars). Use mode='digest' first for an overview of turns + artifacts + Swarm summary, then 'turns' (auto-hydrates truncated full replies, supports charOffset), 'artifacts', or 'swarm' (preserves newest messages, supports startSeq/endSeq/query).",
+    description: "Read a past session by ID/prefix (digest, turns+charOffset, artifacts, swarm).",
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: {
-          type: "string",
-          description: "Full conversation UUID or unambiguous prefix (e.g. 'a1b2c3d4').",
-        },
-        mode: {
-          type: "string",
-          enum: ["digest", "turns", "artifacts", "swarm"],
-          description: "View mode (default 'digest').",
-        },
-        startStep: {
-          type: "integer",
-          description: "For mode='turns': inclusive starting step index.",
-        },
-        endStep: {
-          type: "integer",
-          description: "For mode='turns': inclusive ending step index.",
-        },
-        tailTurns: {
-          type: "integer",
-          description: "For mode='turns' without step bounds: last N turns to show (1..40, default 6).",
-        },
-        charOffset: {
-          type: "integer",
-          description: "For mode='turns': starting character offset to continue reading a large >8.2 KB turn.",
-        },
-        includeTools: {
-          type: "boolean",
-          description: "For mode='turns': include tool call count summary per turn (default false).",
-        },
-        includeThinking: {
-          type: "boolean",
-          description: "For mode='turns': include truncated thinking text (default false).",
-        },
-        artifactName: {
-          type: "string",
-          description: "For mode='artifacts': specific Markdown artifact filename to read.",
-        },
-        startLine: {
-          type: "integer",
-          description: "For mode='artifacts' with artifactName: 1-based start line (default 1).",
-        },
-        endLine: {
-          type: "integer",
-          description: "For mode='artifacts' with artifactName: 1-based inclusive end line (default 180).",
-        },
-        tailMessages: {
-          type: "integer",
-          description: "For mode='swarm': last N board messages to show (1..100, default 20; newest preserved within budget).",
-        },
-        startSeq: {
-          type: "integer",
-          description: "For mode='swarm': inclusive starting message sequence number (#seq).",
-        },
-        endSeq: {
-          type: "integer",
-          description: "For mode='swarm': inclusive ending message sequence number (#seq).",
-        },
-        query: {
-          type: "string",
-          description: "For mode='swarm': optional multi-word AND filter matched against board agent and text.",
-        },
-        maxChars: {
-          type: "integer",
-          description: "Output character cap (200..8200, default 8200).",
-        },
+        sessionId: { type: "string", description: "ID, prefix (>=4), or source:id." },
+        source: { type: "string", enum: SOURCE_ENUM, description: "Source (default agy)." },
+        mode: { type: "string", enum: ["digest", "turns", "artifacts", "swarm"], description: "View mode." },
+        startStep: { type: "integer", description: "turns: start step." },
+        endStep: { type: "integer", description: "turns: end step." },
+        tailTurns: { type: "integer", description: "turns: last N (1..40)." },
+        charOffset: { type: "integer", description: "turns: >8.2KB offset." },
+        includeTools: { type: "boolean", description: "turns: tool counts." },
+        includeThinking: { type: "boolean", description: "turns: thinking." },
+        artifactName: { type: "string", description: "artifacts: filename." },
+        startLine: { type: "integer", description: "artifacts: start line." },
+        endLine: { type: "integer", description: "artifacts: end line." },
+        tailMessages: { type: "integer", description: "swarm: last N (1..100)." },
+        startSeq: { type: "integer", description: "swarm: start #seq." },
+        endSeq: { type: "integer", description: "swarm: end #seq." },
+        query: { type: "string", description: "swarm: agent/text filter." },
+        maxChars: { type: "integer", description: "Char cap (200..8200)." },
       },
       required: ["sessionId"],
     },
@@ -187,69 +89,32 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
   {
     name: "save_note",
     description:
-      "Save, update, or delete a curated cross-session memory note stored persistently on disk (outside any single conversation). Never store secrets or tokens.",
+      "Save, update, or delete an editable Markdown note (topics/<id>.md + MEMORY.md index). Returns Revision; expectedRevision rejects stale writes/deletes without overwriting. Never store secrets.",
     inputSchema: {
       type: "object",
       properties: {
-        topic: {
-          type: "string",
-          description: "Short descriptive title/topic of the note.",
-        },
-        content: {
-          type: "string",
-          description: "Concise fact, decision, conclusion, or preference to remember across sessions.",
-        },
-        workspace: {
-          type: "string",
-          description: "Optional workspace path this note applies to (omit for global notes).",
-        },
-        tags: {
-          type: "array",
-          items: { type: "string" },
-          description: "Optional tags for recall filtering.",
-        },
-        sessionId: {
-          type: "string",
-          description: "Optional source conversation ID.",
-        },
-        id: {
-          type: "string",
-          description: "Optional existing note ID to update in place.",
-        },
-        deleteId: {
-          type: "string",
-          description: "If set, deletes the note with this ID instead of saving.",
-        },
+        topic: { type: "string", description: "Short descriptive title." },
+        content: { type: "string", description: "Markdown note body." },
+        workspace: { type: "string", description: "Optional workspace path (omit to preserve on update, or global on create)." },
+        tags: { type: "array", items: { type: "string" }, description: "Tags for recall." },
+        sessionId: { type: "string", description: "Optional source session ID." },
+        id: { type: "string", description: "Existing note ID to update (ASCII alnum/_/-)." },
+        expectedRevision: { type: "string", description: "Revision hash from save/recall for safe CAS update/delete." },
+        deleteId: { type: "string", description: "Delete note by ID." },
       },
     },
   },
   {
     name: "recall_notes",
-    description:
-      "Recall previously saved cross-session memory notes filtered by query (matches ID, topic, content, tags, workspace), workspace, or tag.",
+    description: "Recall saved Markdown notes (returns file Path and Revision for direct read_file or CAS updates).",
     inputSchema: {
       type: "object",
       properties: {
-        query: {
-          type: "string",
-          description: "Optional multi-word search query (supports quoted phrases).",
-        },
-        workspace: {
-          type: "string",
-          description: "Optional workspace path filter (also keeps global and parent-workspace notes).",
-        },
-        tag: {
-          type: "string",
-          description: "Optional exact tag filter.",
-        },
-        limit: {
-          type: "integer",
-          description: "Maximum notes to return (1..30, default 15).",
-        },
-        maxChars: {
-          type: "integer",
-          description: "Output character cap (200..8200, default 8200).",
-        },
+        query: { type: "string", description: "Multi-word/quoted filter on ID, topic, content, tags, workspace." },
+        workspace: { type: "string", description: "Workspace filter (keeps global/parent notes)." },
+        tag: { type: "string", description: "Exact tag filter." },
+        limit: { type: "integer", description: "Max notes (1..30, default 15)." },
+        maxChars: { type: "integer", description: "Char cap (200..8200)." },
       },
     },
   },
@@ -280,6 +145,7 @@ export function executeToolResult(
     case "list_sessions":
       return listSessionsResult({
         dataDir,
+        source: asString(args.source) || "agy",
         workspace: asString(args.workspace),
         query: asString(args.query),
         includeChildren: Boolean(args.includeChildren),
@@ -293,6 +159,8 @@ export function executeToolResult(
       return searchSessionsResult({
         dataDir,
         query: asString(args.query),
+        mode: asString(args.mode) || "text",
+        source: asString(args.source) || "agy",
         scope: asString(args.scope) || "all",
         regex: Boolean(args.regex),
         sessionId: asString(args.sessionId),
@@ -307,6 +175,7 @@ export function executeToolResult(
     case "read_session":
       return readSessionResult({
         dataDir,
+        source: asString(args.source) || "agy",
         sessionId: asString(args.sessionId),
         mode: asString(args.mode) || "digest",
         startStep: typeof args.startStep === "number" ? args.startStep : null,
@@ -324,21 +193,27 @@ export function executeToolResult(
         query: asString(args.query),
         maxChars: asOptionalNumber(args.maxChars),
       });
-    case "save_note":
+    case "save_note": {
+      const hasWs = Object.prototype.hasOwnProperty.call(args, "workspace") && args.workspace !== undefined;
+      const hasTags = Object.prototype.hasOwnProperty.call(args, "tags") && args.tags !== undefined;
       return saveNoteResult({
         dataDir,
         id: asString(args.id),
         deleteId: asString(args.deleteId),
         topic: asString(args.topic),
         content: asString(args.content),
-        workspace: asString(args.workspace),
-        tags: Array.isArray(args.tags)
-          ? (args.tags as string[])
-          : typeof args.tags === "string"
-            ? args.tags
-            : [],
+        workspace: hasWs ? asString(args.workspace) : undefined,
+        tags: hasTags
+          ? Array.isArray(args.tags)
+            ? (args.tags as string[])
+            : typeof args.tags === "string"
+              ? args.tags
+              : []
+          : undefined,
         sessionId: asString(args.sessionId),
+        expectedRevision: asString(args.expectedRevision),
       });
+    }
     case "recall_notes":
       return recallNotesResult({
         dataDir,
