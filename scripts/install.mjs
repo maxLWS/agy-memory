@@ -71,15 +71,42 @@ function resolveInstalledDataDir() {
 }
 
 function tryAgyCommand(args) {
-  const bins = process.platform === "win32" ? ["agy.cmd", "agy.exe", "agy"] : ["agy"];
-  for (const bin of bins) {
+  const candidates =
+    process.platform === "win32"
+      ? [
+          { bin: "agy.exe", opts: {} },
+          { bin: "agy", opts: {} },
+        ]
+      : [{ bin: "agy", opts: {} }];
+
+  // On Windows, `.cmd` wrappers (e.g. npm global shims) require cmd.exe; only invoke if `where.exe` finds one.
+  if (process.platform === "win32") {
+    try {
+      const locate = spawnSync("where.exe", ["agy.cmd"], {
+        encoding: "utf8",
+        timeout: 2000,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      if (locate.status === 0 && locate.stdout && locate.stdout.trim()) {
+        const firstPath = locate.stdout.trim().split(/\r?\n/)[0];
+        if (firstPath) {
+          candidates.push({ bin: firstPath, opts: { shell: true } });
+        }
+      }
+    } catch {
+      // Ignore if where.exe is unavailable
+    }
+  }
+
+  for (const { bin, opts } of candidates) {
     try {
       const res = spawnSync(bin, args, {
         encoding: "utf8",
         timeout: 10000,
         stdio: ["ignore", "pipe", "pipe"],
+        ...opts,
       });
-      if (res.error && res.error.code === "ENOENT") continue;
+      if (res.error) continue;
       return { found: true, status: res.status ?? 1, stdout: res.stdout || "", stderr: res.stderr || "" };
     } catch {
       // Try next
