@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "memory": {
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/dist/mcp-server.mjs"
+      ],
+      "tools": {
+        "list_sessions": {
+          "eager": true
+        },
+        "search_sessions": {
+          "eager": true
+        },
+        "read_session": {
+          "eager": true
+        },
+        "save_note": {
+          "eager": true
+        },
+        "recall_notes": {
+          "eager": true
+        }
+      }
+    }
+  }
+}

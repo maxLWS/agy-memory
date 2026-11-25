@@ -1,0 +1,8 @@
+node_modules/
+.tmp/
+*.tsbuildinfo
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+rules/AGENTS.local.md

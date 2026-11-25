@@ -1,0 +1,61 @@
+{
+  "name": "agy-memory",
+  "version": "0.2.0",
+  "description": "Fast, zero-dependency cross-conversation memory, search, digest reader, and persistent note MCP plugin for Google Antigravity (agy).",
+  "type": "module",
+  "author": "maxLWS",
+  "homepage": "https://github.com/maxLWS/agy-memory#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/maxLWS/agy-memory.git"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "agy-memory": "./scripts/install.mjs"
+  },
+  "files": [
+    "plugin.json",
+    "mcp_config.json",
+    "hooks.json",
+    "rules/AGENTS.md",
+    "assets/*.svg",
+    "dist/*.mjs",
+    "scripts/install.mjs",
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node scripts/test.mjs",
+    "validate": "agy plugin validate --strict .",
+    "install:plugin": "node scripts/install.mjs install",
+    "update:plugin": "node scripts/install.mjs update",
+    "uninstall:plugin": "node scripts/install.mjs uninstall",
+    "doctor": "node scripts/install.mjs doctor",
+    "stats": "node dist/mcp-server.mjs --cli stats",
+    "bench:stress": "npm run build && node scripts/stress-benchmark.mjs"
+  },
+  "keywords": [
+    "antigravity",
+    "agy",
+    "plugin",
+    "mcp",
+    "memory",
+    "history",
+    "search",
+    "conversations",
+    "swarm"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  }
+}

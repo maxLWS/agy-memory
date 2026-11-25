@@ -1,0 +1,27 @@
+{
+  "name": "agy-memory",
+  "displayName": "agy-memory",
+  "version": "0.2.0",
+  "logo": "assets/logo.svg",
+  "description": "Fast, zero-dependency cross-conversation memory, full-reply search, Swarm board inspection, and persistent note MCP plugin for Antigravity.",
+  "author": {
+    "name": "maxLWS",
+    "url": "https://github.com/maxLWS"
+  },
+  "repository": "https://github.com/maxLWS/agy-memory",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "history",
+    "conversations",
+    "search",
+    "mcp",
+    "swarm",
+    "productivity"
+  ],
+  "suggestedPrompts": [
+    "List my recent conversations in this workspace",
+    "Search past conversations for decisions about authentication or caching",
+    "Summarize the conclusions from conversation a1b2c3d4"
+  ]
+}
