@@ -2,6 +2,39 @@
 
 All notable changes to `agy-memory` are listed here.
 
+## [0.4.1] - 2026-11-26
+
+### Fixed
+- **Unclipped Swarm message inspection (`read_session(mode="swarm")`)**: removed the hardcoded 1,400-char per-message cap on small slices in `src/store.ts`. Single-message reads (`startSeq=N, endSeq=N`) now use the full inline budget (~7,500 chars, staying `<= 8,650` UTF-8 bytes with zero disk spills), 2–4 message slices scale dynamically across the budget, and clipped summaries now print the exact `startSeq=N endSeq=N` hint (or full `board.jsonl` path for extreme single messages).
+- **Verified impact on real Swarm audit recall (`F1`)**: dropped from 126.5s timeout / 23 turns / 196.5k billable / 4 spills (`v0.4.0`) to 50.4s / 5 turns / 63.9k billable / 0 raw shell history reads / 0 spills (`v0.4.1`).
+
+## [0.4.0] - 2026-11-26
+
+### Added
+- **Project Blackboard (`board_read`, `board_post`)**:
+  - Stores active project conventions, accepted decisions, and open handoffs as one Markdown file per key under `~/.gemini/agy-memory/boards/<scope>/entries/<slug>.md`, with human-editable frontmatter (`schema: 1`, `key`, `title`, `updatedAt`, `sourceClient`, `sourceSession`, optional `sourceStep`).
+  - Uses per-key atomic `linkSync` locking plus a serialized dead-PID reaper (zero global lock; distinct keys write lock-free; live writers are never preempted) and mandatory `expectedRevision` compare-and-swap on updates and deletes.
+  - Includes idempotent, non-destructive migration (`--cli migrate-notes`) from legacy `topics/*.md` / `notes.json`.
+- **Disjoint `ScopeKey` aggregation & Turn-0 `project_id` resolution (`src/scope.ts`)**:
+  - Separates named Antigravity Projects (`project/<projectId>`) from plain CLI repositories (`cli_repo/<gitCommonDir>`, unifying linked Git worktrees with zero subprocesses), plain non-Git workspaces (`cli_workspace/<root>`), `global`, and fail-closed `unresolved`.
+  - Reads top-level Protobuf field 18 (`project_id`) and field 7 (workspace URI) directly from WAL-safe `conversations/<id>.db` so brand-new `agy --project <id>` sessions receive their exact Project Blackboard on Turn 0 before `conversation_summaries.db` is populated.
+  - Merges catalogs across Antigravity App (`~/.gemini/antigravity`), CLI (`~/.gemini/antigravity-cli`), and IDE (`~/.gemini/antigravity-ide`) by `conversation_id`, failing closed to `unresolved` on conflicting `project_id` and preserving transcript-bearing copies.
+- **Read-only whole-unit `SessionStart` snapshot (`src/snapshot.ts`)**:
+  - Inlines whole board entries when total rendered bytes `<= 1,536` UTF-8 bytes; degrades cleanly to a whole-key index above `1,536` bytes without mid-entry truncation.
+  - Adds a 1-line sibling activity hint (`AGY_MEMORY_SIBLING_HINT=0` to disable) and removes the legacy "last 5 titles + 88-char prompt slice" heuristic.
+
+### Changed
+- **Focused 4-tool MCP surface (4 tools / 43 params, down from 5 tools / 52 params)**:
+  - Merged `list_sessions` into `search_sessions` (omit `query` in `text` mode to list recent sessions).
+  - Enforced strict scope boundaries on `search_sessions` (requires `conversationId`, `scopeKey`, `sessionId`, `workspace`, or explicit `allScopes=true`) so sibling Projects sharing one folder never bleed into each other.
+  - Trimmed tool descriptions and `rules/AGENTS.md` (1,361 B), cutting Turn-1 metadata from `7,674 B` (`v0.3.0`) and `13,946 B` (post-v0.3.0 schema expansion) to `7,092 B` (`-656` Turn-1 input tokens vs. `v0.3.0`, `-1,753` vs. expanded schemas).
+  - Hardened `--cli` boolean flag parsing (`--delete=false`, `--all-scopes`, etc.) so boolean switches never swallow positional queries and reject invalid boolean strings.
+
+### Removed
+- **Removed Codex (`~/.codex`) and Claude Code (`~/.claude`) cross-CLI adapters** (`src/adapters.ts`, ~500 LOC) to keep `agy-memory` focused on Google Antigravity (`App`, `CLI`, and `IDE`).
+- **Replaced legacy `save_note` / `recall_notes` (`src/notes.ts`, global `.notes.lock`, `MEMORY.md` index)** with the per-key Project Blackboard.
+- **Moved offline usage stats (`analytics.ts`) out of the runtime MCP bundle** into `scripts/analytics.ts`.
+
 ## [0.3.0] - 2026-11-25
 
 ### Added
