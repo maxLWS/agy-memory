@@ -130,7 +130,10 @@ export function normalizeCanonicalPath(rawPath: string): string {
   }
   try {
     if (fs.existsSync(candidate)) {
-      candidate = fs.realpathSync(candidate);
+      candidate =
+        typeof fs.realpathSync.native === "function"
+          ? fs.realpathSync.native(candidate)
+          : fs.realpathSync(candidate);
     }
   } catch {
   }
