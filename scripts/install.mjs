@@ -199,7 +199,7 @@ function runDoctor(targetDir) {
   const mcpTarget = fs.existsSync(installedMcp) ? installedMcp : path.join(REPO_ROOT, "dist", "mcp-server.mjs");
   const dataDir = resolveInstalledDataDir();
   const t0 = Date.now();
-  const cliRun = spawnSync(process.execPath, [mcpTarget, "--cli", "list", "--limit", "3"], {
+  const cliRun = spawnSync(process.execPath, [mcpTarget, "--cli", "search", "--all-scopes", "--limit", "3"], {
     encoding: "utf8",
     timeout: 5000,
   });
@@ -233,7 +233,7 @@ function runDoctor(targetDir) {
         .map((l) => JSON.parse(l));
       const ver = lines[0]?.result?.serverInfo?.version;
       const toolCount = lines[1]?.result?.tools?.length;
-      mcpOk = Boolean(ver && toolCount === 5);
+      mcpOk = Boolean(ver && toolCount === 4);
       mcpDetail = `server v${ver}, ${toolCount} tools`;
     } catch (err) {
       mcpDetail = `invalid JSON-RPC response: ${err instanceof Error ? err.message : String(err)}`;

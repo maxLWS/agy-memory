@@ -5,12 +5,10 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { analyzeMemoryUsage, formatMemoryUsageMarkdown } from "../src/analytics.js";
 import { buildSessionStartSnapshot } from "../src/snapshot.js";
 import {
   clearStoreCaches,
   decodeWorkspaceUris,
-  noteWorkspaceMatches,
   truncateUtf8,
   workspaceMatches,
 } from "../src/store.js";
@@ -256,53 +254,53 @@ function createFixtureDataDir() {
   return { root, s1, s2, s3, hasDb };
 }
 
-test("list_sessions, search_sessions (CJK + English + artifacts + swarm), and read_session modes work cleanly", () => {
+test("search_sessions (queryless listing + CJK/EN + artifacts + swarm), read_session, and board tools work cleanly", () => {
   clearStoreCaches();
   const { root, s1, s2, hasDb } = createFixtureDataDir();
+  const boardsHome = path.join(root, "boards-home");
   try {
-    // 1) list_sessions excludes child workers by default, supports prefix excludeSessionId and minSteps
-    const listed = executeTool("list_sessions", { limit: 10 }, { dataDir: root });
+    const unscopedBlocked = executeToolResult("search_sessions", { maxSessions: 10 }, { dataDir: root });
+    assert.equal(unscopedBlocked.isError, true, "unscoped search_sessions must require conversationId or allScopes=true");
+
+    const listed = executeTool("search_sessions", { maxSessions: 10, allScopes: true }, { dataDir: root });
     assert.ok(listed.includes("11111111"), listed);
     assert.ok(listed.includes("[swarm, 1 artifacts]"), listed);
     assert.ok(listed.includes("22222222"), listed);
     assert.equal(listed.includes("33333333"), false, "child worker should be hidden by default");
     if (hasDb) {
       assert.ok(listed.includes("Gateway Cache Audit"), listed);
-      const minStepsOut = executeTool("list_sessions", { minSteps: 10 }, { dataDir: root });
-      assert.ok(minStepsOut.includes("11111111"), minStepsOut);
-      assert.equal(minStepsOut.includes("22222222"), false, "minSteps=10 should skip 8-step session");
     }
 
-    const excludedPrefix = executeTool("list_sessions", { excludeSessionId: "11111111" }, { dataDir: root });
+    const excludedPrefix = executeTool("search_sessions", { excludeSessionId: "11111111", allScopes: true }, { dataDir: root });
     assert.equal(excludedPrefix.includes("11111111"), false, "8-char prefix excludeSessionId must work");
     assert.ok(excludedPrefix.includes("22222222"), excludedPrefix);
 
-    const withChildren = executeTool("list_sessions", { includeChildren: true }, { dataDir: root });
+    const withChildren = executeTool("search_sessions", { includeChildren: true, allScopes: true }, { dataDir: root });
     assert.ok(withChildren.includes("33333333"));
 
     // 2) search_sessions supports CJK multi-word AND, JSON-escaped chars, transcript_full hydration, sessionId, artifacts with Path, and swarm
-    const cjkHit = executeTool("search_sessions", { query: "限流熔断 缓存击穿" }, { dataDir: root });
+    const cjkHit = executeTool("search_sessions", { query: "限流熔断 缓存击穿", allScopes: true }, { dataDir: root });
     assert.ok(cjkHit.includes(s1), cjkHit);
     assert.equal(cjkHit.includes(s2), false);
 
     // JSON-escaped quotes in transcript & Go HTML escapes in swarm board
     const quotedHit = executeTool(
       "search_sessions",
-      { query: 'retry_scope="last-hop"', scope: "assistant" },
+      { query: 'retry_scope="last-hop"', scope: "assistant", allScopes: true },
       { dataDir: root },
     );
     assert.ok(quotedHit.includes(s1), quotedHit);
 
-    const htmlEscSwarm = executeTool("search_sessions", { query: "<=200", scope: "swarm" }, { dataDir: root });
+    const htmlEscSwarm = executeTool("search_sessions", { query: "<=200", scope: "swarm", allScopes: true }, { dataDir: root });
     assert.ok(htmlEscSwarm.includes("swarm:analyst"), htmlEscSwarm);
 
-    const ampSwarm = executeTool("search_sessions", { query: '"cache & limiter"', scope: "swarm" }, { dataDir: root });
+    const ampSwarm = executeTool("search_sessions", { query: '"cache & limiter"', scope: "swarm", allScopes: true }, { dataDir: root });
     assert.ok(ampSwarm.includes("swarm:analyst"), ampSwarm);
 
     // transcript_full.jsonl hydration makes truncated conclusions searchable AND readable
     const hydratedSearch = executeTool(
       "search_sessions",
-      { query: '"令牌桶容量 420"', scope: "assistant" },
+      { query: '"令牌桶容量 420"', scope: "assistant", allScopes: true },
       { dataDir: root },
     );
     assert.ok(hydratedSearch.includes(s1), hydratedSearch);
@@ -316,7 +314,7 @@ test("list_sessions, search_sessions (CJK + English + artifacts + swarm), and re
 
     const artHit = executeTool(
       "search_sessions",
-      { query: "singleflight lock reset", scope: "artifacts" },
+      { query: "singleflight lock reset", scope: "artifacts", allScopes: true },
       { dataDir: root },
     );
     assert.ok(artHit.includes("artifact:gateway_audit_report.md"), artHit);
@@ -324,11 +322,11 @@ test("list_sessions, search_sessions (CJK + English + artifacts + swarm), and re
 
     if (hasDb) {
       // Strict scope isolation: title-only word "Audit" must NOT match scope="swarm"
-      const scopeLeakSwarm = executeTool("search_sessions", { query: "Gateway", scope: "swarm" }, { dataDir: root });
+      const scopeLeakSwarm = executeTool("search_sessions", { query: "Gateway", scope: "swarm", allScopes: true }, { dataDir: root });
       assert.ok(scopeLeakSwarm.includes("No past conversations matched"), scopeLeakSwarm);
     }
 
-    const swarmHit = executeTool("search_sessions", { query: "216 burst", scope: "swarm" }, { dataDir: root });
+    const swarmHit = executeTool("search_sessions", { query: "216 burst", scope: "swarm", allScopes: true }, { dataDir: root });
     assert.ok(swarmHit.includes("swarm:analyst"), swarmHit);
 
     // 3) read_session supports prefix lookup + digest / turns (hydrated) / artifacts / swarm modes
@@ -359,40 +357,41 @@ test("list_sessions, search_sessions (CJK + English + artifacts + swarm), and re
     assert.ok(swarmRead.includes("Gateway Audit Swarm"), swarmRead);
     assert.ok(swarmRead.includes("Audited 216 burst"), swarmRead);
 
-    // 4) save_note (incl string tags coercion), recall_notes (incl note.id & quoted phrases), snapshot (with Current session + tags)
-    const saved = executeTool(
-      "save_note",
+    const posted = executeTool(
+      "board_post",
       {
-        id: "DEMO-1001",
-        topic: "Cache lock tuning",
-        content: "Keep singleflight TTL at 15s for gateway burst traffic.",
-        workspace: "/workspace/demo",
-        tags: "gateway, caching",
-        sessionId: s1,
+        key: "cache-lock-tuning",
+        title: "Cache lock tuning",
+        body: "Keep singleflight TTL at 15s for gateway burst traffic.",
+        scope: "project/demo-proj",
+        conversationId: s1,
       },
-      { dataDir: root },
+      { dataDir: root, boardsHome },
     );
-    assert.ok(saved.includes("[DEMO-1001]"), saved);
+    assert.ok(posted.includes("cache-lock-tuning"), posted);
+    const revMatch = /Revision:\s*([0-9a-f]{12})/.exec(posted);
+    assert.ok(revMatch?.[1], posted);
 
-    const recalledById = executeTool("recall_notes", { query: "DEMO-1001" }, { dataDir: root });
-    assert.ok(recalledById.includes("Cache lock tuning"), "recall_notes must search note.id");
-
-    const recalledQuoted = executeTool("recall_notes", { query: '"TTL at 15s"', tag: "gateway" }, { dataDir: root });
-    assert.ok(recalledQuoted.includes("Cache lock tuning"), recalledQuoted);
+    const readBack = executeTool(
+      "board_read",
+      { scope: "project/demo-proj", query: "15s" },
+      { dataDir: root, boardsHome },
+    );
+    assert.ok(readBack.includes("Cache lock tuning"), readBack);
+    assert.ok(readBack.includes("11111111"), readBack);
 
     const snapshot = buildSessionStartSnapshot(
       { conversationId: s2, workspacePaths: ["/workspace/demo"] },
-      root,
+      { overrideDataDir: root, boardsHome },
     );
-    assert.ok(snapshot.includes("Current session: 22222222"), snapshot);
-    assert.equal(snapshot.includes("- 22222222"), false, "snapshot should exclude current session from recent list");
-    assert.ok(snapshot.includes("[gateway, caching]"), "pinned notes in snapshot should show tags");
-    if (hasDb) {
-      assert.ok(snapshot.includes("11111111"), snapshot);
-    }
+    assert.ok(snapshot.includes("session=22222222"), snapshot);
 
-    const deleted = executeTool("save_note", { deleteId: "DEMO-1001" }, { dataDir: root });
-    assert.match(deleted, /Deleted note/);
+    const deleted = executeTool(
+      "board_post",
+      { key: "cache-lock-tuning", scope: "project/demo-proj", delete: true, expectedRevision: revMatch![1] },
+      { dataDir: root, boardsHome },
+    );
+    assert.match(deleted, /Removed board key/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -477,11 +476,11 @@ test("regression: snippet cap never drops matchedAll, term diversity, in-flight 
       ].join("\n") + "\n",
     );
 
-    const divRes = executeTool("search_sessions", { query: "alpha beta", maxSnippetsPerSession: 3 }, { dataDir: root });
+    const divRes = executeTool("search_sessions", { query: "alpha beta", maxSnippetsPerSession: 3, allScopes: true }, { dataDir: root });
     assert.ok(divRes.includes("alpha") && divRes.includes("beta"), divRes);
     assert.ok(divRes.includes("#0") || divRes.includes("swarm:"), divRes);
 
-    const negRes = executeTool("search_sessions", { query: "PHANTOM-4040" }, { dataDir: root });
+    const negRes = executeTool("search_sessions", { query: "PHANTOM-4040", allScopes: true }, { dataDir: root });
     assert.ok(negRes.includes("No past conversations matched"), negRes);
     assert.ok(negRes.includes("excluded active in-flight prompt"), negRes);
 
@@ -582,7 +581,7 @@ test("regression: snippet cap never drops matchedAll, term diversity, in-flight 
   }
 });
 
-test("regression: truncateUtf8 surrogate/byte safety, cross-platform workspaceMatches (POSIX + Windows), validation errors, and offline analytics", () => {
+test("regression: truncateUtf8 surrogate/byte safety, bidirectional workspaceMatches (POSIX + Windows), and validation errors", () => {
   // 1) Surrogate pair & strict byte/char bounds
   const emojiText = "hello 🚀🚀🚀 world ".repeat(40);
   const clipped = truncateUtf8(emojiText, 64, 80);
@@ -606,12 +605,10 @@ test("regression: truncateUtf8 surrogate/byte safety, cross-platform workspaceMa
   const negClip = truncateUtf8("abcdef".repeat(200), -5, 8650);
   assert.ok(negClip.startsWith("abcdef"), negClip.slice(0, 30));
 
-  // 2) Path-boundary workspaceMatches & noteWorkspaceMatches (POSIX + Windows)
-  assert.equal(workspaceMatches(["/workspace/demo"], "/workspace/demo/cli-ui"), false);
+  assert.equal(workspaceMatches(["/workspace/demo"], "/workspace/demo/cli-ui"), true);
   assert.equal(workspaceMatches(["/workspace/demo/cli-ui"], "/workspace/demo"), true);
   assert.equal(workspaceMatches(["/workspace/agy-memory"], "/workspace/agy"), false);
-  assert.equal(noteWorkspaceMatches("/workspace/demo/cli-ui", "/workspace/demo/cli"), false);
-  assert.equal(noteWorkspaceMatches("/workspace/demo", "/workspace/demo/cli-ui"), true);
+  assert.equal(workspaceMatches(["/workspace/demo/cli-ui"], "/workspace/demo/cli"), false);
 
   // Windows URI & path normalization
   assert.deepEqual(decodeWorkspaceUris('["file:///C:/Users/dev/my-app"]'), ["C:/Users/dev/my-app"]);
@@ -625,27 +622,17 @@ test("regression: truncateUtf8 surrogate/byte safety, cross-platform workspaceMa
     assert.equal(badMode.isError, true);
     assert.ok(badMode.text.includes("Invalid mode"), badMode.text);
 
-    const badScope = executeToolResult("search_sessions", { query: "test", scope: "bogus" }, { dataDir: root });
+    const badScope = executeToolResult("search_sessions", { query: "test", scope: "bogus", allScopes: true }, { dataDir: root });
     assert.equal(badScope.isError, true);
     assert.ok(badScope.text.includes("Invalid scope"), badScope.text);
 
-    const badRegex = executeToolResult("search_sessions", { query: "[unclosed", regex: true }, { dataDir: root });
+    const badRegex = executeToolResult("search_sessions", { query: "[unclosed", regex: true, allScopes: true }, { dataDir: root });
     assert.equal(badRegex.isError, true);
     assert.ok(badRegex.text.includes("Invalid regular expression"), badRegex.text);
-
-    const emptyQuotes = executeToolResult("search_sessions", { query: '""' }, { dataDir: root });
-    assert.equal(emptyQuotes.isError, true);
-    assert.ok(emptyQuotes.text.includes("query is required"), emptyQuotes.text);
 
     const oobStep = executeToolResult("read_session", { sessionId: "11111111", mode: "turns", startStep: 99999 }, { dataDir: root });
     assert.equal(oobStep.isError, true);
     assert.ok(oobStep.text.includes("Valid step range"), oobStep.text);
-
-    // 4) Offline analytics
-    const report = analyzeMemoryUsage({ dataDir: root, recent: 10 });
-    assert.equal(report.overall.sessions, 2);
-    const md = formatMemoryUsageMarkdown(report);
-    assert.ok(md.includes("agy-memory Offline Transcript Analytics"), md);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -681,13 +668,13 @@ test("bundled MCP stdio server handles JSONL, LSP (Content-Type before Content-L
       jsonrpc: "2.0",
       id: 3,
       method: "tools/call",
-      params: { name: "search_sessions", arguments: { query: "OSC 8", toolSummary: "Search OSC 8" } },
+      params: { name: "search_sessions", arguments: { query: "OSC 8", allScopes: true, toolSummary: "Search OSC 8" } },
     });
     send({
       jsonrpc: "2.0",
       id: 4,
       method: "tools/call",
-      params: { name: "search_sessions", arguments: { query: "" } },
+      params: { name: "search_sessions", arguments: { mode: "file_history", query: "", allScopes: true } },
     });
     send({ jsonrpc: "2.0", id: 5 });
     child.stdin.write("{malformed json\n");
@@ -698,18 +685,18 @@ test("bundled MCP stdio server handles JSONL, LSP (Content-Type before Content-L
     assert.equal(responses.length, 6);
     assert.equal(responses[0]!.id, 0);
     const initResult = responses[0]!.result as Record<string, unknown>;
-    assert.equal((initResult.serverInfo as Record<string, unknown>).version, "0.3.0");
-    assert.ok(typeof initResult.instructions === "string" && initResult.instructions.includes("list_sessions"));
+    assert.equal((initResult.serverInfo as Record<string, unknown>).version, "0.4.1");
+    assert.ok(typeof initResult.instructions === "string" && initResult.instructions.includes("board_read"));
     const listedTools = (responses[1]!.result as Record<string, unknown>).tools as Array<{
       name: string;
       description: string;
       annotations?: Record<string, unknown>;
     }>;
-    assert.equal(listedTools.length, 5);
+    assert.equal(listedTools.length, 4);
     for (const tool of listedTools) {
       assert.ok(tool.annotations && typeof tool.annotations.title === "string", `missing annotations on ${tool.name}`);
       assert.equal(tool.annotations.openWorldHint, false, `${tool.name} should be local-only`);
-      if (tool.name === "save_note") {
+      if (tool.name === "board_post") {
         assert.equal(tool.annotations.readOnlyHint, false);
         assert.equal(tool.annotations.destructiveHint, true);
         assert.equal(tool.annotations.idempotentHint, false);
@@ -744,17 +731,10 @@ test("bundled MCP stdio server handles JSONL, LSP (Content-Type before Content-L
     assert.ok(lspOut.includes("Content-Length:"), `LSP frame failed: ${lspOut}`);
     assert.ok(lspOut.includes('"id":1'), lspOut);
 
-    // --cli search & --cli stats
-    const cliOut = execFileSync(process.execPath, [serverPath, "--cli", "search", "--data-dir", root, "限流熔断"], {
+    const cliOut = execFileSync(process.execPath, [serverPath, "--cli", "search", "--data-dir", root, "--all-scopes", "限流熔断"], {
       encoding: "utf8",
     });
     assert.ok(cliOut.includes("11111111"), cliOut);
-
-    const statsOut = execFileSync(process.execPath, [serverPath, "--cli", "stats", "--data-dir", root, "--json"], {
-      encoding: "utf8",
-    });
-    const parsedStats = JSON.parse(statsOut) as { overall: { sessions: number } };
-    assert.equal(parsedStats.overall.sessions, 2);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

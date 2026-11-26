@@ -1,7 +1,7 @@
 {
   "name": "agy-memory",
-  "version": "0.3.0",
-  "description": "Fast, zero-dependency cross-conversation memory, search, digest reader, and persistent note MCP plugin for Google Antigravity (agy).",
+  "version": "0.4.1",
+  "description": "Project Blackboard and Verbatim Session Archive MCP plugin for Google Antigravity (App, CLI, and IDE).",
   "type": "module",
   "author": "maxLWS",
   "homepage": "https://github.com/maxLWS/agy-memory#readme",
@@ -39,7 +39,6 @@
     "update:plugin": "node scripts/install.mjs update",
     "uninstall:plugin": "node scripts/install.mjs uninstall",
     "doctor": "node scripts/install.mjs doctor",
-    "stats": "node dist/mcp-server.mjs --cli stats",
     "bench:stress": "npm run build && node scripts/stress-benchmark.mjs"
   },
   "keywords": [

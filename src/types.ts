@@ -1,5 +1,16 @@
-export type HarnessSource = "agy" | "codex" | "claude";
-export type SourceFilter = HarnessSource | "all";
+export type ClientKind = "app" | "cli" | "ide" | "custom";
+
+export interface ClientDataRoot {
+  client: ClientKind;
+  dataDir: string;
+}
+
+export type ScopeKey =
+  | { kind: "project"; projectId: string }
+  | { kind: "cli_repo"; commonGitDir: string }
+  | { kind: "cli_workspace"; root: string }
+  | { kind: "global" }
+  | { kind: "unresolved"; reason?: string };
 
 export interface ToolResult {
   text: string;
@@ -26,14 +37,18 @@ export interface RawSummaryRow {
   lastModifiedTime: string;
   workspaceUris: string | string[];
   status: string;
+  projectId: string;
+  appDataDir: string;
+  notFullyIdle: boolean;
   parentConversationId: string;
   nestingDepth: number;
   lastUserInputTime: string;
 }
 
 export interface SessionEntry {
-  source: HarnessSource;
-  canonicalId: string; // `${source}:${sessionId}`
+  client: ClientKind;
+  dataDir: string;
+  canonicalId: string;
   sessionId: string;
   shortId: string;
   title: string;
@@ -42,6 +57,9 @@ export interface SessionEntry {
   updatedMs: number;
   workspaces: string[];
   status: string;
+  projectId: string;
+  notFullyIdle: boolean;
+  scopeKey: ScopeKey;
   isChild: boolean;
   parentConversationId: string;
   hasTranscript: boolean;
@@ -180,60 +198,19 @@ export interface ScanBudget {
   reason: string;
 }
 
-export interface NoteItem {
-  id: string;
-  topic: string;
-  content: string;
-  workspace: string;
-  tags: string[];
-  sessionId: string;
-  createdAt: number;
+export interface BoardSourceRef {
+  client: ClientKind;
+  conversationId: string;
+  step?: number;
+}
+
+export interface BoardEntry {
+  key: string;
+  title: string;
+  body: string;
+  revision: string;
   updatedAt: number;
-  filePath?: string;
-  revision?: string;
-}
-
-export interface NoteLoadResult {
-  notes: NoteItem[];
-  warnings: string[];
-  memoryIndexPath: string;
-  topicsDir: string;
-}
-
-export interface MemoryToolCallCounts {
-  list_sessions: number;
-  search_sessions: number;
-  read_session: number;
-  save_note: number;
-  recall_notes: number;
-}
-
-export interface MemoryUsageBucket {
-  sessions: number;
-  sessionsWithSnapshot: number;
-  sessionsWithMemoryTools: number;
-  llmTurns: number;
-  totalToolCalls: number;
-  memoryToolCalls: MemoryToolCallCounts;
-  rawBrainReads: number;
-  mcpSpills: number;
-  budgetTruncations: number;
-  toolErrors: number;
-  uncachedInputTokens: number;
-  cacheReadTokens: number;
-  outputTokens: number;
-}
-
-export interface FinalizedMemoryUsageBucket extends MemoryUsageBucket {
-  memoryToolCallsTotal: number;
-  avgTurnsPerSession: number;
-  estBillableEquiv: number;
-}
-
-export interface MemoryUsageReport {
-  dataDir: string;
-  analyzedLimit: number;
-  overall: FinalizedMemoryUsageBucket;
-  withAgyMemory: FinalizedMemoryUsageBucket;
-  withoutAgyMemory: FinalizedMemoryUsageBucket;
+  scope: ScopeKey;
+  source?: BoardSourceRef;
+  filePath: string;
 }

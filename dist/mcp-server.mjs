@@ -2,659 +2,23 @@
 // agy-memory MCP Stdio Server & CLI (bundled zero-dependency ESM)
 
 
-// src/analytics.ts
-import fs3 from "node:fs";
-import path3 from "node:path";
-
-// src/store.ts
-import { execFileSync } from "node:child_process";
+// src/board.ts
+import crypto2 from "node:crypto";
 import fs2 from "node:fs";
-import { createRequire } from "node:module";
-import os2 from "node:os";
 import path2 from "node:path";
 
-// src/adapters.ts
+// src/scope.ts
+import { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-var HEAD_META_BYTES = 16 * 1024;
-var CHUNK_BYTES = 64 * 1024;
-var MAX_CACHE = 48;
-var extCatalogCache = /* @__PURE__ */ new Map();
-var extHeadMetaCache = /* @__PURE__ */ new Map();
-var extSearchCache = /* @__PURE__ */ new Map();
-function lruPut(map, key, val, limit = MAX_CACHE) {
-  if (map.has(key)) map.delete(key);
-  map.set(key, val);
-  while (map.size > limit) {
-    const first = map.keys().next().value;
-    if (first === void 0) break;
-    map.delete(first);
-  }
-}
-function createScanBudget(maxScanBytes = 32 * 1024 * 1024, maxScanMs = 2500) {
-  return {
-    maxScanBytes,
-    maxScanMs,
-    startedAtMs: Date.now(),
-    bytesRead: 0,
-    sessionsScanned: 0,
-    incomplete: false,
-    reason: ""
-  };
-}
-function checkScanBudget(budget) {
-  if (!budget) return true;
-  if (budget.incomplete) return false;
-  if (budget.bytesRead >= budget.maxScanBytes) {
-    budget.incomplete = true;
-    budget.reason = `byte budget (${Math.round(budget.maxScanBytes / (1024 * 1024))} MB) reached`;
-    return false;
-  }
-  if (Date.now() - budget.startedAtMs >= budget.maxScanMs) {
-    budget.incomplete = true;
-    budget.reason = `time budget (${budget.maxScanMs} ms) reached`;
-    return false;
-  }
-  return true;
-}
-function streamJsonlFromOffset(filePath, startOffset, onLine, budget) {
-  let fd = null;
-  try {
-    fd = fs.openSync(filePath, "r");
-    const st = fs.fstatSync(fd);
-    const size = st.size;
-    const mtimeMs = st.mtimeMs;
-    let pos = Math.max(0, startOffset);
-    if (pos >= size) {
-      return { newOffset: size, eof: true, size, mtimeMs, ioError: false };
-    }
-    const buf = Buffer.allocUnsafe(CHUNK_BYTES);
-    let carryParts = [];
-    let carryLen = 0;
-    let consumedBytes = pos;
-    while (pos < size) {
-      if (budget && !checkScanBudget(budget)) {
-        return { newOffset: consumedBytes, eof: false, size, mtimeMs, ioError: false };
-      }
-      const remainingBudget = budget ? Math.max(1, budget.maxScanBytes - budget.bytesRead) : CHUNK_BYTES;
-      const toRead = Math.min(CHUNK_BYTES, size - pos, remainingBudget);
-      const n = fs.readSync(fd, buf, 0, toRead, pos);
-      if (n <= 0) break;
-      pos += n;
-      if (budget) budget.bytesRead += n;
-      const slice = buf.subarray(0, n);
-      let segStart = 0;
-      for (let i = 0; i < n; i += 1) {
-        if (slice[i] === 10) {
-          let lineBuf;
-          const tailSlice = slice.subarray(segStart, i);
-          if (carryLen > 0) {
-            carryParts.push(tailSlice);
-            lineBuf = Buffer.concat(carryParts, carryLen + tailSlice.length);
-            carryParts = [];
-            carryLen = 0;
-          } else {
-            lineBuf = tailSlice;
-          }
-          consumedBytes += lineBuf.length + 1;
-          segStart = i + 1;
-          const line = lineBuf.toString("utf8").trim();
-          if (line) onLine(line);
-        }
-      }
-      if (segStart < n) {
-        const rem = Buffer.from(slice.subarray(segStart));
-        carryParts.push(rem);
-        carryLen += rem.length;
-      }
-    }
-    if (carryLen > 0 && pos >= size) {
-      const trailing = Buffer.concat(carryParts, carryLen);
-      const trimmed = trailing.toString("utf8").trim();
-      if (trimmed) {
-        let validJson = false;
-        try {
-          JSON.parse(trimmed);
-          validJson = true;
-        } catch {
-          validJson = false;
-        }
-        if (validJson) {
-          consumedBytes += carryLen;
-          onLine(trimmed);
-        }
-      } else {
-        consumedBytes += carryLen;
-      }
-    }
-    return { newOffset: consumedBytes, eof: pos >= size, size, mtimeMs, ioError: false };
-  } catch (err) {
-    if (budget) {
-      budget.incomplete = true;
-      budget.reason = `I/O read error (${err instanceof Error ? err.message : "read failed"})`;
-    }
-    return { newOffset: startOffset, eof: false, size: 0, mtimeMs: 0, ioError: true };
-  } finally {
-    if (fd !== null) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-      }
-    }
-  }
-}
-function readHeadUtf8(filePath, maxBytes = HEAD_META_BYTES) {
-  let fd = null;
-  try {
-    fd = fs.openSync(filePath, "r");
-    const size = fs.fstatSync(fd).size;
-    if (size <= 0) return "";
-    const len = Math.min(size, maxBytes);
-    const buf = Buffer.allocUnsafe(len);
-    fs.readSync(fd, buf, 0, len, 0);
-    return buf.toString("utf8");
-  } catch {
-    return "";
-  } finally {
-    if (fd !== null) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-      }
-    }
-  }
-}
-function emptyPaths(transcriptPath) {
-  const dir = path.dirname(transcriptPath);
-  return {
-    brainDir: dir,
-    systemDir: dir,
-    transcriptPath,
-    transcriptFullPath: "",
-    swarmDir: "",
-    swarmMembersPath: "",
-    swarmBoardPath: "",
-    swarmPlanPath: "",
-    subagentsDir: ""
-  };
-}
-function formatDateShort(ms) {
-  if (!ms || ms <= 0) return "";
-  const d = new Date(ms);
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mi = String(d.getMinutes()).padStart(2, "0");
-  return `${mm}-${dd} ${hh}:${mi}`;
-}
-function parseTs(raw) {
-  if (typeof raw === "number" && Number.isFinite(raw)) {
-    return raw > 1e12 ? raw : raw > 1e9 ? raw * 1e3 : raw;
-  }
-  if (typeof raw !== "string" || !raw.trim()) return 0;
-  const ms = Date.parse(raw.replace(/(\.\d{3})\d+/, "$1"));
-  return Number.isNaN(ms) ? 0 : ms;
-}
-function resolveCodexDir() {
-  return (process.env.CODEX_HOME || "").trim() || path.join(os.homedir(), ".codex");
-}
-function resolveClaudeDir() {
-  return (process.env.CLAUDE_CONFIG_DIR || "").trim() || path.join(os.homedir(), ".claude");
-}
-function walkJsonlFiles(rootDir, maxDepth = 4, skipDirNames = /* @__PURE__ */ new Set()) {
-  const out = [];
-  if (!fs.existsSync(rootDir)) return out;
-  const walk = (dir, depth) => {
-    if (depth > maxDepth) return;
-    let items;
-    try {
-      items = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const d of items) {
-      if (d.name.startsWith(".")) continue;
-      const full = path.join(dir, d.name);
-      if (d.isDirectory()) {
-        if (skipDirNames.has(d.name)) continue;
-        walk(full, depth + 1);
-      } else if (d.isFile() && d.name.endsWith(".jsonl")) {
-        out.push(full);
-      }
-    }
-  };
-  walk(rootDir, 0);
-  out.sort();
-  return out;
-}
-function normalizeTextBlocks(content) {
-  if (typeof content === "string") return content.trim();
-  if (!Array.isArray(content)) return "";
-  const parts = [];
-  for (const b of content) {
-    if (!b || typeof b !== "object") continue;
-    const obj = b;
-    if (typeof obj.text === "string" && obj.text.trim()) {
-      parts.push(obj.text.trim());
-    }
-  }
-  return parts.join("\n").trim();
-}
-function isCodexSystemBoilerplate(text) {
-  const t = text.trim();
-  if (!t) return true;
-  if (t.startsWith("<permissions instructions>") || t.startsWith("<environment_context>")) return true;
-  if (t.startsWith("# AGENTS.md instructions for ") || t.startsWith("<INSTRUCTIONS>")) return true;
-  return false;
-}
-function resolveToolPath(rawPath, primaryWorkspace) {
-  const cleaned = String(rawPath || "").trim().replace(/^["']|["']$/g, "");
-  if (!cleaned) return { rawPath: "", resolvedPath: "", basename: "" };
-  const isWin = /^[a-zA-Z]:[\\/]/.test(cleaned) || /^[a-zA-Z]:[\\/]/.test(primaryWorkspace);
-  const pathImpl = isWin ? path.win32 : path.posix;
-  let resolved = cleaned;
-  if (!pathImpl.isAbsolute(cleaned) && primaryWorkspace) {
-    resolved = pathImpl.resolve(primaryWorkspace, cleaned);
-  } else {
-    resolved = pathImpl.normalize(cleaned);
-  }
-  const normalized = resolved.replace(/\\/g, "/");
-  const basename = path.posix.basename(normalized);
-  return { rawPath: cleaned, resolvedPath: normalized, basename };
-}
-function statAllFiles(files) {
-  const out = [];
-  for (const filePath of files) {
-    try {
-      out.push({ filePath, st: fs.statSync(filePath) });
-    } catch {
-    }
-  }
-  return out;
-}
-function computeFullCatalogSig(indexMtime, statList) {
-  return `${statList.length}|${indexMtime}|${statList.map((x) => `${x.filePath}:${Math.round(x.st.mtimeMs)}:${x.st.size}`).join("|")}`;
-}
-function loadCodexCatalog(codexDir = resolveCodexDir()) {
-  if (!fs.existsSync(codexDir)) return [];
-  const sessionsDir = path.join(codexDir, "sessions");
-  const archivedDir = path.join(codexDir, "archived_sessions");
-  const indexPath = path.join(codexDir, "session_index.jsonl");
-  const files = [...walkJsonlFiles(sessionsDir, 4), ...walkJsonlFiles(archivedDir, 4)];
-  const statList = statAllFiles(files);
-  const indexMtime = fs.existsSync(indexPath) ? Math.round(fs.statSync(indexPath).mtimeMs) : 0;
-  const sig = computeFullCatalogSig(indexMtime, statList);
-  const cacheKey = `codex:${codexDir}`;
-  const cached = extCatalogCache.get(cacheKey);
-  if (cached && cached.sig === sig) return cached.entries;
-  const titles = /* @__PURE__ */ new Map();
-  if (fs.existsSync(indexPath)) {
-    try {
-      for (const line of fs.readFileSync(indexPath, "utf8").split("\n")) {
-        if (!line.trim()) continue;
-        const row = JSON.parse(line);
-        if (row.id) {
-          titles.set(row.id, {
-            title: String(row.thread_name || "").trim(),
-            updatedMs: parseTs(row.updated_at)
-          });
-        }
-      }
-    } catch {
-    }
-  }
-  statList.sort((a, b) => b.st.mtimeMs - a.st.mtimeMs);
-  const entries = [];
-  for (const { filePath, st } of statList) {
-    const fname = path.basename(filePath, ".jsonl");
-    const idMatch = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(fname);
-    const defaultId = idMatch ? idMatch[1] : fname;
-    const headSig = `${Math.round(st.mtimeMs)}:${st.size}`;
-    let meta = extHeadMetaCache.get(filePath);
-    if (!meta || meta.sig !== headSig) {
-      let sessionId = defaultId;
-      let cwd = "";
-      let startedMs = 0;
-      let firstUser = "";
-      const head = readHeadUtf8(filePath, HEAD_META_BYTES);
-      for (const line of head.split("\n")) {
-        if (!line.trim()) continue;
-        let obj;
-        try {
-          obj = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (obj.type === "session_meta" && obj.payload && typeof obj.payload === "object") {
-          const p = obj.payload;
-          if (p.id || p.session_id) sessionId = String(p.id || p.session_id).trim();
-          if (!cwd && typeof p.cwd === "string") cwd = p.cwd.trim();
-          if (!startedMs) startedMs = parseTs(p.timestamp || obj.timestamp);
-        } else if (!firstUser && obj.type === "response_item" && obj.payload && typeof obj.payload === "object") {
-          const p = obj.payload;
-          if (p.type === "message" && p.role === "user") {
-            const txt = normalizeTextBlocks(p.content);
-            if (!isCodexSystemBoilerplate(txt)) {
-              firstUser = txt.replace(/\s+/g, " ").slice(0, 120);
-            }
-          }
-        }
-        if (cwd && firstUser) break;
-      }
-      meta = { sig: headSig, sessionId, cwd, startedMs, firstUser, isSidechain: false };
-      extHeadMetaCache.set(filePath, meta);
-    }
-    const finalIdx = titles.get(meta.sessionId) || titles.get(defaultId);
-    const updatedMs = Math.max(st.mtimeMs, finalIdx?.updatedMs || 0, meta.startedMs);
-    const title = finalIdx?.title || meta.firstUser.slice(0, 72) || "(codex session)";
-    const approxSteps = Math.max(1, Math.round(st.size / 1800));
-    entries.push({
-      source: "codex",
-      canonicalId: `codex:${meta.sessionId}`,
-      sessionId: meta.sessionId,
-      shortId: meta.sessionId.slice(0, 8),
-      title,
-      preview: meta.firstUser || title,
-      stepCount: approxSteps,
-      updatedMs,
-      workspaces: meta.cwd ? [meta.cwd] : [],
-      status: "IDLE",
-      isChild: false,
-      parentConversationId: "",
-      hasTranscript: true,
-      hasSwarm: false,
-      paths: emptyPaths(filePath)
-    });
-  }
-  entries.sort((a, b) => b.updatedMs - a.updatedMs);
-  extCatalogCache.set(cacheKey, { sig, entries });
-  return entries;
-}
-function loadClaudeCatalog(claudeDir = resolveClaudeDir()) {
-  if (!fs.existsSync(claudeDir)) return [];
-  const projectsDir = path.join(claudeDir, "projects");
-  const transcriptsDir = path.join(claudeDir, "transcripts");
-  const historyPath = path.join(claudeDir, "history.jsonl");
-  const files = [
-    ...walkJsonlFiles(projectsDir, 2, /* @__PURE__ */ new Set(["subagents"])),
-    ...walkJsonlFiles(transcriptsDir, 2, /* @__PURE__ */ new Set(["subagents"]))
-  ];
-  const statList = statAllFiles(files);
-  const historyMtime = fs.existsSync(historyPath) ? Math.round(fs.statSync(historyPath).mtimeMs) : 0;
-  const sig = computeFullCatalogSig(historyMtime, statList);
-  const cacheKey = `claude:${claudeDir}`;
-  const cached = extCatalogCache.get(cacheKey);
-  if (cached && cached.sig === sig) return cached.entries;
-  const historyMeta = /* @__PURE__ */ new Map();
-  if (fs.existsSync(historyPath)) {
-    try {
-      for (const line of fs.readFileSync(historyPath, "utf8").split("\n")) {
-        if (!line.trim()) continue;
-        const row = JSON.parse(line);
-        if (row.sessionId) {
-          const prev = historyMeta.get(row.sessionId);
-          const ts = parseTs(row.timestamp);
-          historyMeta.set(row.sessionId, {
-            project: String(row.project || prev?.project || "").trim(),
-            title: String(row.display || prev?.title || "").replace(/\s+/g, " ").trim().slice(0, 80),
-            updatedMs: Math.max(ts, prev?.updatedMs || 0)
-          });
-        }
-      }
-    } catch {
-    }
-  }
-  const seenIds = /* @__PURE__ */ new Set();
-  const entries = [];
-  for (const { filePath, st } of statList) {
-    const baseId = path.basename(filePath, ".jsonl");
-    const headSig = `${Math.round(st.mtimeMs)}:${st.size}`;
-    let meta = extHeadMetaCache.get(filePath);
-    if (!meta || meta.sig !== headSig) {
-      let embeddedId = "";
-      let cwd2 = "";
-      let firstUser = "";
-      let startedMs = 0;
-      let isSidechain = baseId.startsWith("agent-");
-      const head = readHeadUtf8(filePath, HEAD_META_BYTES);
-      for (const line of head.split("\n")) {
-        if (!line.trim()) continue;
-        let obj;
-        try {
-          obj = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (obj.isSidechain === true) isSidechain = true;
-        if (!embeddedId && typeof obj.sessionId === "string" && obj.sessionId.trim()) {
-          embeddedId = obj.sessionId.trim();
-        }
-        if (!cwd2 && typeof obj.cwd === "string" && obj.cwd.trim()) cwd2 = obj.cwd.trim();
-        if (!startedMs) startedMs = parseTs(obj.timestamp);
-        if (!firstUser && obj.type === "user") {
-          const msg = obj.message;
-          const txt = msg ? normalizeTextBlocks(msg.content) : normalizeTextBlocks(obj.content);
-          if (txt) firstUser = txt.replace(/\s+/g, " ").slice(0, 120);
-        }
-      }
-      const sessionId = isSidechain ? baseId : embeddedId || baseId;
-      meta = { sig: headSig, sessionId, cwd: cwd2, startedMs, firstUser, isSidechain };
-      extHeadMetaCache.set(filePath, meta);
-    }
-    let finalSessionId = meta.sessionId;
-    let isChild = meta.isSidechain;
-    let parentId = "";
-    if (seenIds.has(finalSessionId)) {
-      parentId = finalSessionId;
-      finalSessionId = baseId !== finalSessionId ? baseId : `${finalSessionId}-${entries.length + 1}`;
-      isChild = true;
-    }
-    seenIds.add(finalSessionId);
-    const h = historyMeta.get(finalSessionId);
-    const cwd = meta.cwd || h?.project || "";
-    const title = h?.title || meta.firstUser.slice(0, 72) || "(claude session)";
-    const updatedMs = Math.max(st.mtimeMs, h?.updatedMs || 0, meta.startedMs);
-    const approxSteps = Math.max(1, Math.round(st.size / 1200));
-    const shortId = finalSessionId.startsWith("ses_") ? finalSessionId.slice(0, 12) : finalSessionId.slice(0, 8);
-    entries.push({
-      source: "claude",
-      canonicalId: `claude:${finalSessionId}`,
-      sessionId: finalSessionId,
-      shortId,
-      title,
-      preview: meta.firstUser || title,
-      stepCount: approxSteps,
-      updatedMs,
-      workspaces: cwd ? [cwd] : [],
-      status: "IDLE",
-      isChild,
-      parentConversationId: parentId,
-      hasTranscript: true,
-      hasSwarm: false,
-      paths: emptyPaths(filePath)
-    });
-  }
-  entries.sort((a, b) => b.updatedMs - a.updatedMs);
-  extCatalogCache.set(cacheKey, { sig, entries });
-  return entries;
-}
-function handleExternalLineForSearch(source, line, state) {
-  let obj;
-  try {
-    obj = JSON.parse(line);
-  } catch {
-    return;
-  }
-  const idx = state.nextStep;
-  state.nextStep += 1;
-  const date = formatDateShort(parseTs(obj.timestamp));
-  if (source === "codex") {
-    if (obj.type === "response_item" && obj.payload && typeof obj.payload === "object") {
-      const p = obj.payload;
-      if (p.type === "message" && (p.role === "user" || p.role === "assistant")) {
-        const text = normalizeTextBlocks(p.content);
-        if (!text || p.role === "user" && isCodexSystemBoilerplate(text)) return;
-        const msg = {
-          stepIndex: idx,
-          role: p.role,
-          date,
-          text,
-          lowText: text.toLowerCase()
-        };
-        state.messages.push(msg);
-      }
-    } else if (obj.type === "event_msg" && obj.payload && typeof obj.payload === "object") {
-      const p = obj.payload;
-      if (p.type === "user_message" && typeof p.message === "string" && p.message.trim()) {
-        const text = p.message.trim();
-        if (!isCodexSystemBoilerplate(text)) {
-          state.messages.push({ stepIndex: idx, role: "user", date, text, lowText: text.toLowerCase() });
-        }
-      } else if (p.type === "agent_message" && typeof p.message === "string" && p.message.trim()) {
-        const text = p.message.trim();
-        state.messages.push({ stepIndex: idx, role: "assistant", date, text, lowText: text.toLowerCase() });
-      }
-    }
-    return;
-  }
-  if (source === "claude") {
-    if (obj.type === "user" || obj.type === "assistant") {
-      const msgObj = obj.message;
-      const text = msgObj ? normalizeTextBlocks(msgObj.content) : normalizeTextBlocks(obj.content);
-      if (!text) return;
-      state.messages.push({
-        stepIndex: idx,
-        role: obj.type,
-        date,
-        text,
-        lowText: text.toLowerCase()
-      });
-    }
-  }
-}
-function getExternalSearchableDoc(entry, budget) {
-  const filePath = entry.paths.transcriptPath;
-  let st;
-  try {
-    st = fs.statSync(filePath);
-  } catch (err) {
-    if (budget) {
-      budget.incomplete = true;
-      budget.reason = `transcript stat error (${err instanceof Error ? err.message : "stat failed"})`;
-    }
-    return { messages: [], artifacts: [], board: [], latestTranscriptMtimeMs: 0, inFlightUserStepIndex: -1 };
-  }
-  const cached = extSearchCache.get(filePath);
-  let state;
-  let startOffset = 0;
-  const canReuseExact = cached && cached.size === st.size && cached.mtimeMs === st.mtimeMs;
-  const canResumeAppend = cached && cached.eof && cached.size < st.size;
-  if (canReuseExact && cached.eof) {
-    return cached.state;
-  }
-  if (canReuseExact && !cached.eof) {
-    state = cached.state;
-    startOffset = cached.offset;
-  } else if (canResumeAppend) {
-    state = cached.state;
-    startOffset = cached.offset;
-  } else {
-    state = {
-      messages: [],
-      artifacts: [],
-      board: [],
-      latestTranscriptMtimeMs: st.mtimeMs,
-      inFlightUserStepIndex: -1,
-      nextStep: 0,
-      lastUser: ""
-    };
-  }
-  const res = streamJsonlFromOffset(
-    filePath,
-    startOffset,
-    (line) => handleExternalLineForSearch(entry.source, line, state),
-    budget
-  );
-  if (!res.ioError) {
-    state.latestTranscriptMtimeMs = res.mtimeMs || st.mtimeMs;
-    lruPut(extSearchCache, filePath, {
-      offset: res.newOffset,
-      eof: res.eof,
-      mtimeMs: res.mtimeMs,
-      size: res.size,
-      state
-    });
-  }
-  return state;
-}
-function isExternalDocCached(entry) {
-  const cached = extSearchCache.get(entry.paths.transcriptPath);
-  if (!cached || !cached.eof) return false;
-  try {
-    const st = fs.statSync(entry.paths.transcriptPath);
-    return cached.size === st.size && cached.mtimeMs === st.mtimeMs;
-  } catch {
-    return false;
-  }
-}
-function parseExternalTurns(entry) {
-  const doc = getExternalSearchableDoc(entry);
-  const turns = [];
-  let cur = null;
-  for (const m of doc.messages) {
-    if (m.role === "user") {
-      cur = {
-        turnIndex: turns.length + 1,
-        startStep: m.stepIndex,
-        endStep: m.stepIndex,
-        createdAt: m.date,
-        userStepIndex: m.stepIndex,
-        userText: m.text,
-        userContentTruncated: false,
-        assistantResponses: [],
-        tools: [],
-        thoughts: [],
-        models: [entry.source],
-        finalAssistantText: "",
-        finalAssistantTruncated: false
-      };
-      turns.push(cur);
-    } else if (m.role === "assistant") {
-      if (!cur) {
-        cur = {
-          turnIndex: turns.length + 1,
-          startStep: m.stepIndex,
-          endStep: m.stepIndex,
-          createdAt: m.date,
-          userStepIndex: -1,
-          userText: "",
-          userContentTruncated: false,
-          assistantResponses: [],
-          tools: [],
-          thoughts: [],
-          models: [entry.source],
-          finalAssistantText: "",
-          finalAssistantTruncated: false
-        };
-        turns.push(cur);
-      }
-      cur.endStep = m.stepIndex;
-      cur.assistantResponses.push({
-        stepIndex: m.stepIndex,
-        createdAt: m.date,
-        text: m.text,
-        contentTruncated: false
-      });
-      cur.finalAssistantText = m.text;
-    }
-  }
-  return turns;
-}
-
-// src/store.ts
-var TAIL_PREVIEW_BYTES = 160 * 1024;
-var TAIL_FALLBACK_BYTES = 1024 * 1024;
+var DEFAULT_PROJECT_SENTINELS = /* @__PURE__ */ new Set(["default-cli-project"]);
+var CONVERSATION_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{7,127}$/;
+var PROJECT_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:@/-]{0,127}$/;
+var MAX_TRAJECTORY_BLOB_BYTES = 2 * 1024 * 1024;
+var DEFAULT_BUSY_TIMEOUT_MS = 1e3;
 var SQLITE_CANDIDATES = process.platform === "win32" ? ["sqlite3", "sqlite3.exe"] : ["sqlite3", "/usr/bin/sqlite3", "/usr/local/bin/sqlite3", "/opt/homebrew/bin/sqlite3"];
 var PYTHON_INVOCATIONS = process.platform === "win32" ? [
   { bin: "python", prefixArgs: [] },
@@ -665,15 +29,6 @@ var PYTHON_INVOCATIONS = process.platform === "win32" ? [
   { bin: "/usr/bin/python3", prefixArgs: [] },
   { bin: "python", prefixArgs: [] }
 ];
-var TRUNCATION_SUFFIX = "\n\u2026 [truncated to fit inline budget]";
-var MAX_TURN_CACHE_ENTRIES = 64;
-var MAX_FULL_CACHE_ENTRIES = 32;
-var MAX_DOC_CACHE_ENTRIES = 64;
-var VALID_READ_MODES = /* @__PURE__ */ new Set(["digest", "turns", "artifacts", "swarm"]);
-var catalogCache = /* @__PURE__ */ new Map();
-var turnsCache = /* @__PURE__ */ new Map();
-var fullStepsCache = /* @__PURE__ */ new Map();
-var searchDocCache = /* @__PURE__ */ new Map();
 var cachedNodeSqliteCtor;
 function getNodeSqliteCtor() {
   if (cachedNodeSqliteCtor !== void 0) return cachedNodeSqliteCtor;
@@ -686,6 +41,981 @@ function getNodeSqliteCtor() {
   }
   return cachedNodeSqliteCtor;
 }
+function getBusyTimeoutMs() {
+  const raw = Number(process.env.AGY_MEMORY_SQLITE_TIMEOUT_MS);
+  if (Number.isFinite(raw) && raw >= 50 && raw <= 3e4) {
+    return Math.floor(raw);
+  }
+  return DEFAULT_BUSY_TIMEOUT_MS;
+}
+function getGeminiHome() {
+  const envHome = (process.env.GEMINI_HOME || "").trim();
+  if (envHome) return path.resolve(envHome);
+  return path.join(os.homedir(), ".gemini");
+}
+function resolveBoardsHome(overrideHome = "") {
+  if (overrideHome && overrideHome.trim()) return path.resolve(overrideHome.trim());
+  const envHome = (process.env.AGY_MEMORY_HOME || "").trim();
+  if (envHome) return path.resolve(envHome);
+  return path.join(getGeminiHome(), "agy-memory");
+}
+function classifyClientDir(dirPath) {
+  const base = path.basename(path.resolve(dirPath)).toLowerCase();
+  if (base === "antigravity") return "app";
+  if (base === "antigravity-cli") return "cli";
+  if (base === "antigravity-ide") return "ide";
+  return "custom";
+}
+function discoverClientDataDirs(overrideDir = "") {
+  const explicit = (overrideDir || "").trim() || (process.env.AGY_MEMORY_DATA_DIR || process.env.AGY_APP_DATA_DIR || "").trim();
+  if (explicit) {
+    const resolved = path.isAbsolute(explicit) ? path.resolve(explicit) : path.join(getGeminiHome(), explicit);
+    return [{ client: classifyClientDir(resolved), dataDir: resolved }];
+  }
+  const geminiHome = getGeminiHome();
+  const candidates = [
+    { client: "app", dataDir: path.join(geminiHome, "antigravity") },
+    { client: "cli", dataDir: path.join(geminiHome, "antigravity-cli") },
+    { client: "ide", dataDir: path.join(geminiHome, "antigravity-ide") }
+  ];
+  const existing = candidates.filter((c) => fs.existsSync(c.dataDir));
+  if (existing.length > 0) return existing;
+  return [candidates[1]];
+}
+function normalizeCanonicalPath(rawPath) {
+  const trimmed = String(rawPath || "").trim();
+  if (!trimmed) return "";
+  let candidate = trimmed;
+  if (candidate.startsWith("file://")) {
+    try {
+      candidate = decodeURIComponent(candidate.replace(/^file:\/\//i, ""));
+      if (/^\/[a-zA-Z]:\//.test(candidate)) candidate = candidate.slice(1);
+    } catch {
+      candidate = candidate.replace(/^file:\/\//i, "");
+    }
+  }
+  try {
+    if (fs.existsSync(candidate)) {
+      candidate = fs.realpathSync(candidate);
+    }
+  } catch {
+  }
+  let slash = candidate.replace(/\\/g, "/");
+  if (/^[A-Z]:\//.test(slash)) {
+    slash = `${slash[0].toLowerCase()}${slash.slice(1)}`;
+  }
+  while (slash.length > 1 && slash.endsWith("/") && !/^[a-zA-Z]:\/$/.test(slash)) {
+    slash = slash.slice(0, -1);
+  }
+  return slash;
+}
+function isTempDirectory(rawPath) {
+  const p = normalizeCanonicalPath(rawPath).toLowerCase();
+  if (!p) return false;
+  if (p === "/tmp" || p.startsWith("/tmp/") || p === "/private/tmp" || p.startsWith("/private/tmp/")) {
+    return true;
+  }
+  if (p === "/var/tmp" || p.startsWith("/var/tmp/") || p.includes("/appdata/local/temp/")) {
+    return true;
+  }
+  return false;
+}
+function resolveGitCommonDir(startDir) {
+  const start = normalizeCanonicalPath(startDir);
+  if (!start) return "";
+  let cur = start;
+  try {
+    if (fs.existsSync(cur) && fs.statSync(cur).isFile()) {
+      cur = path.dirname(cur);
+    }
+  } catch {
+    return "";
+  }
+  for (let depth = 0; depth < 32; depth += 1) {
+    const dotGit = path.join(cur, ".git");
+    try {
+      const st = fs.lstatSync(dotGit);
+      if (st.isDirectory()) {
+        if (fs.existsSync(path.join(dotGit, "HEAD"))) {
+          return normalizeCanonicalPath(dotGit);
+        }
+      } else if (st.isFile()) {
+        const content = fs.readFileSync(dotGit, "utf8");
+        const m = /^gitdir:\s*(.+)$/im.exec(content);
+        if (!m?.[1]) return "";
+        const gitDir = path.resolve(cur, m[1].trim());
+        const commonFile = path.join(gitDir, "commondir");
+        if (fs.existsSync(commonFile)) {
+          const relCommon = fs.readFileSync(commonFile, "utf8").trim();
+          if (relCommon) {
+            return normalizeCanonicalPath(path.resolve(gitDir, relCommon));
+          }
+        }
+        return normalizeCanonicalPath(gitDir);
+      }
+    } catch {
+    }
+    const parent = path.dirname(cur);
+    if (!parent || parent === cur) break;
+    cur = parent;
+  }
+  return "";
+}
+function isValidConversationId(id) {
+  return CONVERSATION_ID_RE.test(String(id || "").trim());
+}
+function isValidProjectId(id) {
+  const trimmed = String(id || "").trim();
+  if (!trimmed || trimmed.length > 128) return false;
+  if (trimmed.includes("..") || trimmed.includes("\\")) return false;
+  return PROJECT_ID_RE.test(trimmed);
+}
+function decodeTrajectoryMetadata(blob) {
+  if (!blob || blob.byteLength === 0 || blob.byteLength > MAX_TRAJECTORY_BLOB_BYTES) {
+    return null;
+  }
+  let pos = 0;
+  const len = blob.byteLength;
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let foundProjectId = null;
+  const workspaces = [];
+  const readVarint = () => {
+    let value = 0n;
+    let shift = 0n;
+    for (let count = 0; count < 10; count += 1) {
+      if (pos >= len) return null;
+      const b = blob[pos];
+      pos += 1;
+      if (count === 9 && b > 1) return null;
+      value |= BigInt(b & 127) << shift;
+      if ((b & 128) === 0) return value;
+      shift += 7n;
+    }
+    return null;
+  };
+  while (pos < len) {
+    const tag = readVarint();
+    if (tag === null || tag <= 0n) return null;
+    const wireType = Number(tag & 7n);
+    const fieldNumber = tag >> 3n;
+    if (fieldNumber <= 0n) return null;
+    if (wireType === 0) {
+      if (readVarint() === null) return null;
+    } else if (wireType === 1) {
+      if (pos + 8 > len) return null;
+      pos += 8;
+    } else if (wireType === 2) {
+      const byteLenBig = readVarint();
+      if (byteLenBig === null || byteLenBig < 0n || byteLenBig > BigInt(len - pos)) return null;
+      const byteLen = Number(byteLenBig);
+      const slice = blob.subarray(pos, pos + byteLen);
+      pos += byteLen;
+      if (fieldNumber === 7n) {
+        try {
+          const uri = decoder.decode(slice).trim();
+          const norm = normalizeCanonicalPath(uri);
+          if (norm && !workspaces.includes(norm)) workspaces.push(norm);
+        } catch {
+          return null;
+        }
+      } else if (fieldNumber === 18n) {
+        let decoded;
+        try {
+          decoded = decoder.decode(slice).trim();
+        } catch {
+          return null;
+        }
+        if (!isValidProjectId(decoded)) return null;
+        if (foundProjectId !== null && foundProjectId !== decoded) return null;
+        foundProjectId = decoded;
+      }
+    } else if (wireType === 5) {
+      if (pos + 4 > len) return null;
+      pos += 4;
+    } else {
+      return null;
+    }
+  }
+  return { projectId: foundProjectId, workspaces };
+}
+function readConversationDbMeta(dataDir, conversationId, timeoutMs = getBusyTimeoutMs()) {
+  const cid = String(conversationId || "").trim();
+  if (!isValidConversationId(cid)) {
+    return { projectId: null, workspaces: [], error: "invalid conversationId" };
+  }
+  const dbPath = path.join(path.resolve(dataDir), "conversations", `${cid}.db`);
+  if (!fs.existsSync(dbPath)) {
+    return { projectId: null, workspaces: [] };
+  }
+  const DatabaseSync = getNodeSqliteCtor();
+  if (DatabaseSync) {
+    let db = null;
+    try {
+      db = new DatabaseSync(dbPath, { readOnly: true, timeout: timeoutMs });
+      if (typeof db.exec === "function") {
+        db.exec(`PRAGMA busy_timeout = ${timeoutMs};`);
+      }
+      const rows = db.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1").all();
+      const raw = rows[0]?.data;
+      if (raw instanceof Uint8Array) {
+        const meta = decodeTrajectoryMetadata(raw);
+        return meta ? meta : { projectId: null, workspaces: [], error: "invalid trajectory blob" };
+      }
+      return { projectId: null, workspaces: [] };
+    } catch (err) {
+      return { projectId: null, workspaces: [], error: err instanceof Error ? err.message : String(err) };
+    } finally {
+      try {
+        db?.close();
+      } catch {
+      }
+    }
+  }
+  for (const sqliteBin of SQLITE_CANDIDATES) {
+    try {
+      const stdout = execFileSync(
+        sqliteBin,
+        [
+          "-cmd",
+          `.timeout ${timeoutMs}`,
+          "-readonly",
+          "-json",
+          dbPath,
+          "SELECT hex(data) AS hexdata FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1;"
+        ],
+        {
+          encoding: "utf8",
+          timeout: Math.max(2e3, timeoutMs + 1500),
+          maxBuffer: 4 * 1024 * 1024,
+          stdio: ["ignore", "pipe", "pipe"]
+        }
+      );
+      const trimmed = String(stdout || "").trim();
+      if (!trimmed) return { projectId: null, workspaces: [] };
+      const rows = JSON.parse(trimmed);
+      const hex = typeof rows[0]?.hexdata === "string" ? rows[0].hexdata : "";
+      if (!hex) return { projectId: null, workspaces: [] };
+      const meta = decodeTrajectoryMetadata(Buffer.from(hex, "hex"));
+      return meta ? meta : { projectId: null, workspaces: [], error: "invalid trajectory blob" };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/ENOENT/i.test(msg)) continue;
+      return { projectId: null, workspaces: [], error: msg };
+    }
+  }
+  const pyScript = `
+import json, pathlib, sqlite3, sys
+uri = pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro"
+con = sqlite3.connect(uri, uri=True, timeout=float(sys.argv[2]) / 1000.0)
+try:
+  row = con.execute("SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1").fetchone()
+  print(json.dumps({"hex": row[0].hex() if row and isinstance(row[0], (bytes, bytearray)) else ""}))
+finally:
+  con.close()
+`;
+  for (const inv of PYTHON_INVOCATIONS) {
+    try {
+      const stdout = execFileSync(inv.bin, [...inv.prefixArgs, "-c", pyScript, dbPath, String(timeoutMs)], {
+        encoding: "utf8",
+        timeout: Math.max(2500, timeoutMs + 1500),
+        maxBuffer: 4 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      const parsed = JSON.parse(stdout);
+      if (!parsed.hex) return { projectId: null, workspaces: [] };
+      const meta = decodeTrajectoryMetadata(Buffer.from(parsed.hex, "hex"));
+      return meta ? meta : { projectId: null, workspaces: [], error: "invalid trajectory blob" };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/ENOENT/i.test(msg)) continue;
+      return { projectId: null, workspaces: [], error: msg };
+    }
+  }
+  return { projectId: null, workspaces: [], error: "no sqlite reader available" };
+}
+function pickPrimaryWorkspaceRoot(workspaces) {
+  const candidates = [];
+  for (const w of workspaces) {
+    const norm = normalizeCanonicalPath(w);
+    if (norm && !candidates.includes(norm)) candidates.push(norm);
+  }
+  if (candidates.length === 0) return "";
+  const nonTemp = candidates.find((c) => !isTempDirectory(c));
+  return nonTemp || candidates[0];
+}
+function resolveScopeKey(input) {
+  const rawPid = String(input.projectId ?? "").trim();
+  if (!rawPid) {
+    return { kind: "unresolved", reason: "missing project_id" };
+  }
+  if (!isValidProjectId(rawPid)) {
+    return { kind: "unresolved", reason: "invalid project_id" };
+  }
+  if (!DEFAULT_PROJECT_SENTINELS.has(rawPid)) {
+    return { kind: "project", projectId: rawPid };
+  }
+  const root = pickPrimaryWorkspaceRoot(input.workspaces || []);
+  if (!root) {
+    return { kind: "unresolved", reason: "default-cli-project without workspace" };
+  }
+  const commonGitDir = resolveGitCommonDir(root);
+  if (commonGitDir) {
+    return { kind: "cli_repo", commonGitDir };
+  }
+  return { kind: "cli_workspace", root };
+}
+function formatScopeKey(scope) {
+  switch (scope.kind) {
+    case "project":
+      return `project/${scope.projectId}`;
+    case "cli_repo":
+      return `cli_repo/${scope.commonGitDir}`;
+    case "cli_workspace":
+      return `cli_workspace/${scope.root}`;
+    case "global":
+      return "global";
+    case "unresolved":
+      return "unresolved";
+  }
+}
+function parseExplicitScopeKey(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  if (text === "global") return { kind: "global" };
+  if (text.startsWith("project/")) {
+    const pid = text.slice("project/".length).trim();
+    if (isValidProjectId(pid) && !DEFAULT_PROJECT_SENTINELS.has(pid)) {
+      return { kind: "project", projectId: pid };
+    }
+    return null;
+  }
+  if (text.startsWith("cli_repo/")) {
+    const dir = normalizeCanonicalPath(text.slice("cli_repo/".length));
+    return dir ? { kind: "cli_repo", commonGitDir: dir } : null;
+  }
+  if (text.startsWith("cli_workspace/")) {
+    const dir = normalizeCanonicalPath(text.slice("cli_workspace/".length));
+    return dir ? { kind: "cli_workspace", root: dir } : null;
+  }
+  return null;
+}
+function scopeKeysEqual(a, b) {
+  if (a.kind !== b.kind) return false;
+  switch (a.kind) {
+    case "project":
+      return a.projectId === b.projectId;
+    case "cli_repo":
+      return a.commonGitDir === b.commonGitDir;
+    case "cli_workspace":
+      return a.root === b.root;
+    case "global":
+      return true;
+    case "unresolved":
+      return false;
+  }
+}
+function scopeKeyToBoardDir(scope, boardsHome = resolveBoardsHome()) {
+  if (scope.kind === "unresolved") {
+    throw new Error("Cannot map unresolved scope to a board directory.");
+  }
+  if (scope.kind === "global") {
+    return path.join(path.resolve(boardsHome), "boards", "global");
+  }
+  const canonical = formatScopeKey(scope);
+  const hash = crypto.createHash("sha256").update(canonical, "utf8").digest("hex").slice(0, 20);
+  const label = scope.kind === "project" ? scope.projectId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 24) : path.posix.basename(scope.kind === "cli_repo" ? path.posix.dirname(scope.commonGitDir) : scope.root).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 24) || "ws";
+  return path.join(path.resolve(boardsHome), "boards", `${scope.kind}_${label}_${hash}`);
+}
+
+// src/board.ts
+var KEY_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+var CORRUPT_LOCK_GRACE_MS = 2e3;
+var REAP_GUARD_STALE_MS = 5e3;
+var LOCK_WAIT_TIMEOUT_MS = 2e3;
+var SLEEP_ARR = new Int32Array(new SharedArrayBuffer(4));
+function isValidBoardKey(rawKey) {
+  return KEY_RE.test(String(rawKey || "").trim());
+}
+function normalizeBoardKey(rawKey) {
+  return String(rawKey || "").trim().toLowerCase();
+}
+function sleepSyncMs(ms) {
+  try {
+    Atomics.wait(SLEEP_ARR, 0, 0, Math.max(1, ms));
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+    }
+  }
+}
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = err?.code;
+    return code === "EPERM";
+  }
+}
+function isLockStale(lockPath) {
+  let st;
+  try {
+    st = fs2.statSync(lockPath);
+  } catch {
+    return false;
+  }
+  try {
+    const raw = fs2.readFileSync(lockPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0) {
+      return !isProcessAlive(parsed.pid);
+    }
+  } catch {
+  }
+  return Date.now() - st.mtimeMs > CORRUPT_LOCK_GRACE_MS;
+}
+function tryReapDeadLock(entriesDir, key, lockPath) {
+  const reapDir = path2.join(entriesDir, `.${key}.reap`);
+  try {
+    fs2.mkdirSync(reapDir, { mode: 448 });
+  } catch (err) {
+    const code = err?.code;
+    if (code === "EEXIST") {
+      try {
+        const st = fs2.statSync(reapDir);
+        if (Date.now() - st.mtimeMs > REAP_GUARD_STALE_MS) {
+          fs2.rmdirSync(reapDir);
+        }
+      } catch {
+      }
+    }
+    return false;
+  }
+  try {
+    if (isLockStale(lockPath)) {
+      try {
+        fs2.unlinkSync(lockPath);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  } finally {
+    try {
+      fs2.rmdirSync(reapDir);
+    } catch {
+    }
+  }
+}
+function withPerKeyLock(entriesDir, key, fn) {
+  fs2.mkdirSync(entriesDir, { recursive: true, mode: 448 });
+  const lockPath = path2.join(entriesDir, `.${key}.lock`);
+  const nonce = `${process.pid}-${Date.now()}-${crypto2.randomBytes(6).toString("hex")}`;
+  const claimPath = path2.join(entriesDir, `.${key}.claim.${nonce}`);
+  const lockPayload = JSON.stringify({ pid: process.pid, nonce, createdAt: Date.now() });
+  const claimFd = fs2.openSync(claimPath, "wx", 384);
+  try {
+    fs2.writeFileSync(claimFd, lockPayload, "utf8");
+    fs2.fsyncSync(claimFd);
+  } finally {
+    fs2.closeSync(claimFd);
+  }
+  const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+  let acquired = false;
+  try {
+    while (Date.now() < deadline) {
+      try {
+        fs2.linkSync(claimPath, lockPath);
+        acquired = true;
+        break;
+      } catch (err) {
+        const code = err?.code;
+        if (code !== "EEXIST") {
+          if (code === "EPERM" || code === "EXDEV" || code === "ENOTSUP") {
+            try {
+              const fd = fs2.openSync(lockPath, "wx", 384);
+              try {
+                fs2.writeFileSync(fd, lockPayload, "utf8");
+              } finally {
+                fs2.closeSync(fd);
+              }
+              acquired = true;
+              break;
+            } catch (wxErr) {
+              if (wxErr?.code !== "EEXIST") throw wxErr;
+            }
+          } else {
+            throw err;
+          }
+        }
+        if (isLockStale(lockPath) && tryReapDeadLock(entriesDir, key, lockPath)) {
+          continue;
+        }
+        sleepSyncMs(12);
+      }
+    }
+  } finally {
+    try {
+      fs2.unlinkSync(claimPath);
+    } catch {
+    }
+  }
+  if (!acquired) {
+    throw new Error(`Timed out acquiring board lock for key "${key}" (${lockPath}).`);
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      const cur = fs2.readFileSync(lockPath, "utf8");
+      if (cur.includes(nonce)) {
+        fs2.unlinkSync(lockPath);
+      }
+    } catch {
+    }
+  }
+}
+function writeFileAtomic(filePath, content) {
+  const dir = path2.dirname(filePath);
+  const base = path2.basename(filePath);
+  const tmpPath = path2.join(dir, `.${base}.tmp.${process.pid}.${crypto2.randomBytes(6).toString("hex")}`);
+  let fd = null;
+  try {
+    fd = fs2.openSync(tmpPath, "wx", 384);
+    fs2.writeFileSync(fd, content, "utf8");
+    fs2.fsyncSync(fd);
+    fs2.closeSync(fd);
+    fd = null;
+    fs2.renameSync(tmpPath, filePath);
+  } catch (err) {
+    if (fd !== null) {
+      try {
+        fs2.closeSync(fd);
+      } catch {
+      }
+    }
+    try {
+      if (fs2.existsSync(tmpPath)) fs2.unlinkSync(tmpPath);
+    } catch {
+    }
+    throw err;
+  }
+}
+function yamlScalar(v) {
+  return JSON.stringify(String(v ?? ""));
+}
+function parseYamlScalar(raw) {
+  const s = raw.trim();
+  if (!s) return "";
+  if (s.startsWith('"') && s.endsWith('"')) {
+    try {
+      return String(JSON.parse(s));
+    } catch {
+      return s.slice(1, -1);
+    }
+  }
+  if (s.startsWith("'") && s.endsWith("'")) {
+    return s.slice(1, -1).replace(/''/g, "'");
+  }
+  return s;
+}
+function computeBoardRevision(entry) {
+  const canonical = JSON.stringify({
+    key: entry.key,
+    title: entry.title,
+    body: entry.body,
+    updatedAt: entry.updatedAt,
+    source: entry.source || null
+  });
+  return crypto2.createHash("sha256").update(canonical, "utf8").digest("hex").slice(0, 12);
+}
+function serializeBoardEntry(entry) {
+  const lines = [
+    "---",
+    "schema: 1",
+    `key: ${yamlScalar(entry.key)}`,
+    `title: ${yamlScalar(entry.title)}`,
+    `updatedAt: ${yamlScalar(new Date(entry.updatedAt).toISOString())}`
+  ];
+  if (entry.source?.conversationId) {
+    lines.push(`sourceClient: ${yamlScalar(entry.source.client)}`);
+    lines.push(`sourceSession: ${yamlScalar(entry.source.conversationId)}`);
+    if (typeof entry.source.step === "number" && Number.isFinite(entry.source.step) && entry.source.step >= 0) {
+      lines.push(`sourceStep: ${Math.floor(entry.source.step)}`);
+    }
+  }
+  lines.push("---", "", entry.body.trimEnd(), "");
+  return lines.join("\n");
+}
+function parseBoardEntryFile(filePath, scope) {
+  let raw;
+  let st;
+  try {
+    raw = fs2.readFileSync(filePath, "utf8");
+    st = fs2.statSync(filePath);
+  } catch {
+    return null;
+  }
+  const slug = path2.basename(filePath, ".md");
+  const normalized = raw.replace(/\r\n/g, "\n");
+  let key = slug;
+  let title = "";
+  let updatedAt = Math.floor(st.mtimeMs || Date.now());
+  let sourceClient = "cli";
+  let sourceSession = "";
+  let sourceStep;
+  let body = normalized.trim();
+  if (normalized.startsWith("---\n")) {
+    const endIdx = normalized.indexOf("\n---\n", 4);
+    if (endIdx > 0) {
+      const fm = normalized.slice(4, endIdx);
+      body = normalized.slice(endIdx + 5).trim();
+      for (const line of fm.split("\n")) {
+        const colon = line.indexOf(":");
+        if (colon <= 0) continue;
+        const k = line.slice(0, colon).trim();
+        const v = line.slice(colon + 1).trim();
+        if (k === "key") {
+          const parsedKey = normalizeBoardKey(parseYamlScalar(v));
+          if (isValidBoardKey(parsedKey)) key = parsedKey;
+        } else if (k === "title") {
+          title = parseYamlScalar(v);
+        } else if (k === "updatedAt") {
+          const parsed = Date.parse(parseYamlScalar(v));
+          if (!Number.isNaN(parsed)) updatedAt = parsed;
+        } else if (k === "sourceClient") {
+          const c = parseYamlScalar(v);
+          if (c === "app" || c === "cli" || c === "ide" || c === "custom") sourceClient = c;
+        } else if (k === "sourceSession") {
+          sourceSession = parseYamlScalar(v);
+        } else if (k === "sourceStep") {
+          const num = Number(v);
+          if (Number.isInteger(num) && num >= 0) sourceStep = num;
+        }
+      }
+    }
+  }
+  const source = sourceSession ? { client: sourceClient, conversationId: sourceSession, ...sourceStep !== void 0 ? { step: sourceStep } : {} } : void 0;
+  const revision = computeBoardRevision({ key, title, body, updatedAt, source });
+  return {
+    key,
+    title,
+    body,
+    revision,
+    updatedAt,
+    scope,
+    source,
+    filePath
+  };
+}
+function getBoardEntriesDir(scope, boardsHome = resolveBoardsHome()) {
+  return path2.join(scopeKeyToBoardDir(scope, boardsHome), "entries");
+}
+function loadBoardEntries(scope, boardsHome = resolveBoardsHome()) {
+  if (scope.kind === "unresolved") return [];
+  const entriesDir = getBoardEntriesDir(scope, boardsHome);
+  let files;
+  try {
+    files = fs2.readdirSync(entriesDir).filter((f) => f.endsWith(".md") && !f.startsWith(".")).sort();
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const fn of files) {
+    const parsed = parseBoardEntryFile(path2.join(entriesDir, fn), scope);
+    if (parsed) out.push(parsed);
+  }
+  out.sort((a, b) => b.updatedAt - a.updatedAt || a.key.localeCompare(b.key));
+  return out;
+}
+function formatBoardEntryBlock(entry, includeScopeBadge = false) {
+  const scopeTag = includeScopeBadge && entry.scope.kind === "global" ? " [global]" : "";
+  const titlePart = entry.title && entry.title !== entry.key ? ` \u2014 ${entry.title}` : "";
+  const srcPart = entry.source?.conversationId ? ` \xB7 from ${entry.source.conversationId.slice(0, 8)}${entry.source.step !== void 0 ? `#${entry.source.step}` : ""}` : "";
+  const iso = new Date(entry.updatedAt).toISOString().slice(0, 16).replace("T", " ");
+  return `## ${entry.key}${scopeTag}${titlePart}
+Meta: rev=${entry.revision} \xB7 updated=${iso}Z${srcPart}
+Path: ${entry.filePath}
+${entry.body}`;
+}
+function boardReadResult(opts) {
+  const boardsHome = resolveBoardsHome(opts.boardsHome);
+  const maxChars = Math.max(200, Math.min(8200, Math.floor(Number(opts.maxChars) || 8200)));
+  const maxBytes = Math.min(8650, maxChars + 450);
+  if (opts.scope.kind === "unresolved") {
+    return {
+      text: 'Error: Project scope is unresolved. Pass conversationId (from [agy-memory] startup header) or scope="global".',
+      isError: true
+    };
+  }
+  let entries = loadBoardEntries(opts.scope, boardsHome);
+  if (opts.includeGlobal && opts.scope.kind !== "global") {
+    entries = entries.concat(loadBoardEntries({ kind: "global" }, boardsHome));
+    entries.sort((a, b) => b.updatedAt - a.updatedAt || a.key.localeCompare(b.key));
+  }
+  const wantedKeys = (opts.keys || []).map(normalizeBoardKey).filter(Boolean);
+  if (wantedKeys.length > 0) {
+    const keySet = new Set(wantedKeys);
+    entries = entries.filter((e) => keySet.has(e.key));
+  }
+  const q = String(opts.query || "").trim().toLowerCase();
+  if (q) {
+    const terms = q.split(/\s+/).filter(Boolean);
+    entries = entries.filter((e) => {
+      const hay = `${e.key} ${e.title} ${e.body}`.toLowerCase();
+      return terms.every((t) => hay.includes(t));
+    });
+  }
+  const scopeLabel = formatScopeKey(opts.scope);
+  if (entries.length === 0) {
+    return {
+      text: `Board empty for ${scopeLabel}${wantedKeys.length > 0 ? ` (keys: ${wantedKeys.join(", ")})` : ""}${q ? ` (query: "${opts.query}")` : ""}.`,
+      isError: false
+    };
+  }
+  const startOffset = Math.max(0, Math.floor(Number(opts.offset) || 0));
+  const slice = entries.slice(startOffset);
+  if (slice.length === 0) {
+    return {
+      text: `No entries at offset=${startOffset} (${entries.length} total entries in ${scopeLabel}).`,
+      isError: false
+    };
+  }
+  const header = `Project board (${scopeLabel}${opts.includeGlobal && opts.scope.kind !== "global" ? " + global" : ""}, ${entries.length} entry/entries):`;
+  const blocks = [header];
+  let usedBytes = Buffer.byteLength(header, "utf8");
+  let shownCount = 0;
+  for (const entry of slice) {
+    const block = `
+
+${formatBoardEntryBlock(entry, Boolean(opts.includeGlobal))}`;
+    const bBytes = Buffer.byteLength(block, "utf8");
+    const reserveFooter = 180;
+    if (shownCount > 0 && (usedBytes + bBytes + reserveFooter > maxBytes || blocks.join("").length + block.length + reserveFooter > maxChars)) {
+      break;
+    }
+    if (shownCount === 0 && usedBytes + bBytes > maxBytes) {
+      blocks.push(
+        `
+
+## ${entry.key} (exceeds inline budget: ${bBytes} B; read directly via read_file)
+Meta: rev=${entry.revision}
+Path: ${entry.filePath}`
+      );
+      shownCount += 1;
+      break;
+    }
+    blocks.push(block);
+    usedBytes += bBytes;
+    shownCount += 1;
+  }
+  const remaining = slice.length - shownCount;
+  if (remaining > 0) {
+    blocks.push(`
+
+(${remaining} more entry/entries omitted at entry boundary; call board_read with offset=${startOffset + shownCount}.)`);
+  }
+  return { text: blocks.join(""), isError: false };
+}
+function boardPostResult(opts) {
+  if (opts.scope.kind === "unresolved") {
+    return {
+      text: 'Error: Project scope is unresolved. Pass conversationId (from [agy-memory] startup header) or scope="global" before mutating a board.',
+      isError: true
+    };
+  }
+  const key = normalizeBoardKey(opts.key);
+  if (!isValidBoardKey(key)) {
+    return {
+      text: `Error: Invalid board key "${opts.key}". Use 1..64 lowercase ASCII letters, digits, '.', '_' or '-' starting with a letter or digit (e.g. "release-command").`,
+      isError: true
+    };
+  }
+  const boardsHome = resolveBoardsHome(opts.boardsHome);
+  const entriesDir = getBoardEntriesDir(opts.scope, boardsHome);
+  const entryPath = path2.join(entriesDir, `${key}.md`);
+  const scopeLabel = formatScopeKey(opts.scope);
+  const expectedRev = String(opts.expectedRevision || "").trim();
+  try {
+    return withPerKeyLock(entriesDir, key, () => {
+      const existing = fs2.existsSync(entryPath) ? parseBoardEntryFile(entryPath, opts.scope) : null;
+      if (opts.delete) {
+        if (!existing) {
+          return {
+            text: `Error: Board key "${key}" does not exist in ${scopeLabel}.`,
+            isError: true
+          };
+        }
+        if (!expectedRev) {
+          return {
+            text: `Error: Deleting "${key}" requires expectedRevision="${existing.revision}" (call board_read first).`,
+            isError: true
+          };
+        }
+        if (existing.revision !== expectedRev) {
+          return {
+            text: `Error: Revision conflict deleting "${key}": expected "${expectedRev}", current is "${existing.revision}". Call board_read before retrying.`,
+            isError: true
+          };
+        }
+        fs2.unlinkSync(entryPath);
+        return {
+          text: `Removed board key "${key}" from ${scopeLabel} (previous rev=${existing.revision}).`,
+          isError: false
+        };
+      }
+      const body = String(opts.body ?? "").trim();
+      if (!body) {
+        return {
+          text: `Error: body is required when creating or updating board key "${key}".`,
+          isError: true
+        };
+      }
+      if (existing) {
+        if (!expectedRev) {
+          return {
+            text: `Error: Board key "${key}" already exists in ${scopeLabel} (current rev=${existing.revision}). Pass expectedRevision="${existing.revision}" to replace it.`,
+            isError: true
+          };
+        }
+        if (existing.revision !== expectedRev) {
+          return {
+            text: `Error: Revision conflict updating "${key}": expected "${expectedRev}", current is "${existing.revision}". Call board_read before retrying.`,
+            isError: true
+          };
+        }
+      } else if (expectedRev) {
+        return {
+          text: `Error: Board key "${key}" does not exist in ${scopeLabel}, so expectedRevision="${expectedRev}" cannot match.`,
+          isError: true
+        };
+      }
+      const title = String(opts.title ?? "").trim() || existing?.title || key;
+      const updatedAt = Date.now();
+      const serialized = serializeBoardEntry({
+        key,
+        title,
+        body,
+        updatedAt,
+        source: opts.source
+      });
+      writeFileAtomic(entryPath, serialized);
+      const saved = parseBoardEntryFile(entryPath, opts.scope);
+      const verb = existing ? "Updated" : "Created";
+      return {
+        text: `${verb} board key "${saved.key}" in ${scopeLabel}
+Revision: ${saved.revision}
+Path: ${saved.filePath}`,
+        isError: false
+      };
+    });
+  } catch (err) {
+    return {
+      text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+      isError: true
+    };
+  }
+}
+function migrateLegacyNotes(opts) {
+  const details = [];
+  let imported = 0;
+  let skipped = 0;
+  if (opts.targetScope.kind === "unresolved") {
+    throw new Error("targetScope must be resolved before migrating notes.");
+  }
+  const boardsHome = resolveBoardsHome(opts.boardsHome);
+  const topicsDir = path2.join(path2.resolve(opts.sourceDataDir), "memory", "topics");
+  const legacyJson = path2.join(path2.resolve(opts.sourceDataDir), "plugin_data", "agy-memory", "notes.json");
+  const candidates = [];
+  if (fs2.existsSync(topicsDir)) {
+    for (const fn of fs2.readdirSync(topicsDir).filter((f) => f.endsWith(".md")).sort()) {
+      const raw = fs2.readFileSync(path2.join(topicsDir, fn), "utf8").replace(/\r\n/g, "\n");
+      const slug = normalizeBoardKey(path2.basename(fn, ".md").replace(/[^a-zA-Z0-9._-]/g, "-")).slice(0, 64);
+      let title = slug;
+      let body = raw.trim();
+      let sourceSession = "";
+      if (raw.startsWith("---\n")) {
+        const end = raw.indexOf("\n---\n", 4);
+        if (end > 0) {
+          const fm = raw.slice(4, end);
+          body = raw.slice(end + 5).trim();
+          for (const line of fm.split("\n")) {
+            const c = line.indexOf(":");
+            if (c <= 0) continue;
+            const k = line.slice(0, c).trim();
+            const v = parseYamlScalar(line.slice(c + 1));
+            if (k === "topic" && v) title = v;
+            if (k === "sessionId" && v) sourceSession = v;
+          }
+        }
+      }
+      if (isValidBoardKey(slug) && body) {
+        candidates.push({ key: slug, title, body, sourceSession });
+      }
+    }
+  } else if (fs2.existsSync(legacyJson)) {
+    try {
+      const arr = JSON.parse(fs2.readFileSync(legacyJson, "utf8"));
+      if (Array.isArray(arr)) {
+        for (const item of arr) {
+          const rawId = String(item.id || item.topic || "").toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
+          const body = String(item.content || "").trim();
+          if (isValidBoardKey(rawId) && body) {
+            candidates.push({
+              key: rawId,
+              title: String(item.topic || rawId),
+              body,
+              sourceSession: String(item.sessionId || "")
+            });
+          }
+        }
+      }
+    } catch {
+      details.push(`Skipped unreadable legacy notes.json at ${legacyJson}`);
+    }
+  }
+  for (const c of candidates) {
+    const existingDir = getBoardEntriesDir(opts.targetScope, boardsHome);
+    const existingPath = path2.join(existingDir, `${c.key}.md`);
+    if (fs2.existsSync(existingPath)) {
+      skipped += 1;
+      details.push(`Skipped existing key "${c.key}"`);
+      continue;
+    }
+    const res = boardPostResult({
+      scope: opts.targetScope,
+      key: c.key,
+      title: c.title,
+      body: c.body,
+      boardsHome,
+      source: c.sourceSession ? { client: "cli", conversationId: c.sourceSession } : void 0
+    });
+    if (!res.isError) {
+      imported += 1;
+      details.push(`Imported "${c.key}" -> ${formatScopeKey(opts.targetScope)}`);
+    } else {
+      skipped += 1;
+      details.push(`Skipped "${c.key}": ${res.text}`);
+    }
+  }
+  return { imported, skipped, details };
+}
+
+// src/store.ts
+import { execFileSync as execFileSync2 } from "node:child_process";
+import fs3 from "node:fs";
+import path3 from "node:path";
+var TRUNCATION_SUFFIX = "\n\u2026 [truncated to fit inline budget]";
+var MAX_TURN_CACHE_ENTRIES = 64;
+var MAX_FULL_CACHE_ENTRIES = 32;
+var MAX_DOC_CACHE_ENTRIES = 64;
+var VALID_READ_MODES = /* @__PURE__ */ new Set(["digest", "turns", "artifacts", "swarm"]);
+var catalogCache = /* @__PURE__ */ new Map();
+var turnsCache = /* @__PURE__ */ new Map();
+var fullStepsCache = /* @__PURE__ */ new Map();
+var searchDocCache = /* @__PURE__ */ new Map();
 function lruSet(map, key, value, maxSize) {
   if (map.has(key)) map.delete(key);
   map.set(key, value);
@@ -697,25 +1027,15 @@ function lruSet(map, key, value, maxSize) {
 }
 function statSignature(filePath) {
   try {
-    const st = fs2.statSync(filePath);
+    const st = fs3.statSync(filePath);
     return `${Math.floor(st.mtimeMs)}:${st.size}`;
   } catch {
     return "missing";
   }
 }
 function resolveDataDir(overrideDir = "") {
-  if (overrideDir && String(overrideDir).trim()) {
-    return path2.resolve(String(overrideDir).trim());
-  }
-  const envDir = process.env.AGY_MEMORY_DATA_DIR || process.env.AGY_APP_DATA_DIR || "";
-  if (envDir.trim()) {
-    return path2.isAbsolute(envDir.trim()) ? envDir.trim() : path2.join(os2.homedir(), ".gemini", envDir.trim());
-  }
-  const cliDir = path2.join(os2.homedir(), ".gemini", "antigravity-cli");
-  if (fs2.existsSync(cliDir)) return cliDir;
-  const ideDir = path2.join(os2.homedir(), ".gemini", "antigravity");
-  if (fs2.existsSync(ideDir)) return ideDir;
-  return cliDir;
+  const roots = discoverClientDataDirs(overrideDir);
+  return roots[0].dataDir;
 }
 function clampMaxChars(rawVal, fallback = 8200, minVal = 200, maxVal = 8200) {
   if (rawVal === void 0 || rawVal === null || rawVal === "") return fallback;
@@ -774,11 +1094,11 @@ function truncateUtf8(text, maxChars = 8200, maxBytes = 8650, customSuffix = TRU
   const suffixBytes = Buffer.byteLength(suffix, "utf8");
   const safeMaxChars = Math.max(
     suffixChars + 16,
-    Number.isFinite(Number(maxChars)) ? Math.floor(Number(maxChars)) : 8200
+    Number.isFinite(Number(maxChars)) ? Math.floor(maxChars) : 8200
   );
   const safeMaxBytes = Math.max(
     suffixBytes + 16,
-    Number.isFinite(Number(maxBytes)) ? Math.floor(Number(maxBytes)) : 8650
+    Number.isFinite(Number(maxBytes)) ? Math.floor(maxBytes) : 8650
   );
   if (raw.length <= safeMaxChars && Buffer.byteLength(raw, "utf8") <= safeMaxBytes) {
     return raw;
@@ -802,93 +1122,69 @@ function truncateUtf8(text, maxChars = 8200, maxBytes = 8650, customSuffix = TRU
   }
   return `${out.trimEnd()}${suffix}`;
 }
-function parseQueryTokens(rawQuery) {
-  const text = String(rawQuery || "").trim();
+function parseQueryTokens(query) {
+  const text = String(query || "").trim();
   if (!text) return [];
-  const terms = [];
-  const seen = /* @__PURE__ */ new Set();
-  const tokenRe = /"([^"]*)"|(\S+)/g;
-  let match;
-  while ((match = tokenRe.exec(text)) !== null) {
-    let tok = "";
-    if (match[1] !== void 0) {
-      tok = match[1].trim();
-    } else if (match[2] !== void 0) {
-      tok = match[2].trim();
-      if (/^"+$/.test(tok)) tok = "";
-    }
-    const low = tok.toLowerCase();
-    if (low && !seen.has(low)) {
-      seen.add(low);
-      terms.push(low);
-    }
+  const tokens = [];
+  const re = /"([^"]+)"|'([^']+)'|(\S+)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const tok = (m[1] ?? m[2] ?? m[3] ?? "").trim().toLowerCase();
+    if (tok) tokens.push(tok);
   }
-  return terms;
+  return [...new Set(tokens)];
 }
 function cleanUserRequestText(raw) {
-  if (typeof raw !== "string" || !raw) return "";
-  let text = raw;
-  const openMatch = /<USER_REQUEST>\s*/i.exec(text);
-  if (openMatch) {
-    text = text.slice(openMatch.index + openMatch[0].length);
+  let s = String(raw || "").trim();
+  if (!s) return "";
+  const reqMatch = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i.exec(s);
+  if (reqMatch && reqMatch[1]) {
+    s = reqMatch[1].trim();
   }
-  const closeIdx = text.search(/<\/USER_REQUEST>|<ADDITIONAL_METADATA>|<USER_SETTINGS_CHANGE>/i);
-  if (closeIdx >= 0) {
-    text = text.slice(0, closeIdx);
-  }
-  text = text.replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/gi, "").trim();
-  return text.replace(/\r\n/g, "\n").trim();
+  s = s.replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "").trim();
+  s = s.replace(/<SYSTEM_MESSAGE>[\s\S]*?<\/SYSTEM_MESSAGE>/gi, "").trim();
+  return s;
 }
-function decodeWorkspaceUris(rawJson) {
-  if (!rawJson) return [];
-  let list = [];
-  if (Array.isArray(rawJson)) {
-    list = rawJson;
-  } else {
+function decodeWorkspaceUris(raw) {
+  let arr = [];
+  if (Array.isArray(raw)) {
+    arr = raw;
+  } else if (typeof raw === "string" && raw.trim()) {
     try {
-      const parsed = JSON.parse(String(rawJson));
-      if (Array.isArray(parsed)) list = parsed;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) arr = parsed;
     } catch {
-      return [];
+      arr = [raw];
     }
   }
-  return list.map((u) => {
-    const s = String(u ?? "").trim();
-    if (!s) return "";
-    if (s.startsWith("file://")) {
-      let stripped = s.slice("file://".length);
+  return arr.map((u) => {
+    if (typeof u !== "string") return "";
+    let p = u.trim();
+    if (p.startsWith("file://")) {
       try {
-        stripped = decodeURIComponent(stripped);
+        p = decodeURIComponent(p.replace(/^file:\/\//i, ""));
+        if (/^\/[a-zA-Z]:\//.test(p)) p = p.slice(1);
       } catch {
+        p = p.replace(/^file:\/\//i, "");
       }
-      return stripped.replace(/^\/([A-Za-z]:\/)/, "$1");
     }
-    return s;
+    return p;
   }).filter(Boolean);
 }
 function normalizeFsPath(rawPath) {
-  const trimmed = String(rawPath || "").trim();
-  const normalized = trimmed.replace(/\\/g, "/").replace(/^\/([a-zA-Z]:\/)/, "$1").replace(/\/+$/, "").toLowerCase();
-  return normalized || (trimmed === "/" ? "/" : "");
+  const canon = normalizeCanonicalPath(rawPath);
+  if (!canon) return "";
+  return process.platform === "win32" || process.platform === "darwin" ? canon.toLowerCase() : canon;
 }
 function isTempPath(rawPath) {
-  const norm = normalizeFsPath(rawPath);
-  if (!norm) return false;
-  if (norm === "/tmp" || norm.startsWith("/tmp/") || norm === "/private/tmp" || norm.startsWith("/private/tmp/")) {
-    return true;
-  }
-  const osTmp = normalizeFsPath(os2.tmpdir());
-  if (osTmp && (norm === osTmp || norm.startsWith(`${osTmp}/`))) {
-    return true;
-  }
-  return false;
+  return isTempDirectory(rawPath);
 }
 function formatWorkspaceLabel(rawPath) {
   const trimmed = String(rawPath || "").trim();
   if (!trimmed) return "";
   if (isTempPath(trimmed)) return trimmed;
   const slashNorm = trimmed.replace(/\\/g, "/").replace(/\/+$/, "");
-  return path2.posix.basename(slashNorm) || trimmed;
+  return path3.posix.basename(slashNorm) || trimmed;
 }
 function workspaceMatches(workspaces, filter) {
   if (!filter) return true;
@@ -901,223 +1197,117 @@ function workspaceMatches(workspaces, filter) {
     if (!norm) return false;
     if (norm === f) return true;
     if (isAbsFilter) {
-      return norm.startsWith(`${f}/`);
+      return norm.startsWith(`${f}/`) || f.startsWith(`${norm}/`);
     }
-    const base = path2.posix.basename(norm);
-    return base === f || norm.endsWith(`/${f}`) || norm.includes(`/${f}/`);
+    const lowNorm = norm.toLowerCase();
+    const lowF = f.toLowerCase();
+    const base = path3.posix.basename(lowNorm);
+    return base === lowF || lowNorm.endsWith(`/${lowF}`) || lowNorm.includes(`/${lowF}/`);
   });
-}
-function noteWorkspaceMatches(noteWorkspace, filterWorkspace) {
-  const fw = normalizeFsPath(filterWorkspace);
-  if (!fw) return true;
-  const nw = normalizeFsPath(noteWorkspace);
-  if (!nw) return true;
-  if (nw === fw) return true;
-  const isAbsFilter = fw.startsWith("/") || /^[a-z]:\//.test(fw);
-  if (isAbsFilter) {
-    return nw.startsWith(`${fw}/`) || fw.startsWith(`${nw}/`);
-  }
-  const base = path2.posix.basename(nw);
-  return base === fw || nw.endsWith(`/${fw}`) || nw.includes(`/${fw}/`);
 }
 function parseSessionIdList(spec) {
   if (!spec) return [];
   const rawItems = Array.isArray(spec) ? spec : String(spec).split(",");
   return rawItems.map((item) => String(item ?? "").trim().toLowerCase()).filter(Boolean);
 }
-var VALID_SOURCES = /* @__PURE__ */ new Set(["agy", "codex", "claude", "all"]);
-function parseSourceFilter(raw) {
-  const s = String(raw ?? "agy").trim().toLowerCase() || "agy";
-  if (VALID_SOURCES.has(s)) {
-    return { source: s, error: null };
+function splitClientRef(ref) {
+  const trimmed = String(ref || "").trim();
+  const m = /^(app|cli|ide|custom|agy):(.+)$/i.exec(trimmed);
+  if (m && m[1] && m[2]) {
+    const prefix = m[1].toLowerCase();
+    const id = m[2].trim();
+    if (prefix === "agy") return { client: null, id };
+    return { client: prefix, id };
   }
-  return {
-    source: "agy",
-    error: `Error: Invalid source "${String(raw)}". Expected one of: agy, codex, claude, all.`
-  };
+  return { client: null, id: trimmed };
 }
-function splitCanonicalRef(ref) {
-  const clean = String(ref || "").trim();
-  const m = /^(agy|codex|claude):(.+)$/i.exec(clean);
-  if (m) {
-    return { source: m[1].toLowerCase(), id: m[2].trim() };
-  }
-  return { source: null, id: clean };
-}
-function matchesSessionId(sessionId, filterSpec, entrySource = "agy") {
-  const targets = parseSessionIdList(filterSpec);
-  if (targets.length === 0) return false;
-  const sid = String(sessionId || "").trim().toLowerCase();
-  if (!sid) return false;
-  return targets.some((rawTarget) => {
-    const { source: targetSrc, id: targetId } = splitCanonicalRef(rawTarget);
-    if (targetSrc && targetSrc !== entrySource) return false;
-    const tid = targetId.toLowerCase();
-    if (!tid) return false;
-    if (sid === tid) return true;
-    if (tid.length >= 4 && sid.startsWith(tid)) return true;
-    return false;
+function matchesSessionId(sessionId, spec, sessionClient = "cli") {
+  const items = parseSessionIdList(spec);
+  if (items.length === 0) return false;
+  const lowId = String(sessionId || "").toLowerCase();
+  return items.some((rawItem) => {
+    const { client, id } = splitClientRef(rawItem);
+    if (client && client !== sessionClient) return false;
+    const low = id.toLowerCase();
+    if (!low) return false;
+    return lowId === low || low.length >= 4 && lowId.startsWith(low);
   });
 }
-function readTailUtf8(filePath, maxBytes) {
-  let fd = null;
-  try {
-    fd = fs2.openSync(filePath, "r");
-    const size = fs2.fstatSync(fd).size;
-    if (size <= 0) return { text: "", totalSize: 0 };
-    const start = Math.max(0, size - maxBytes);
-    const length = size - start;
-    const buf = Buffer.allocUnsafe(length);
-    fs2.readSync(fd, buf, 0, length, start);
-    let text = buf.toString("utf8");
-    if (start > 0) {
-      const nl = text.indexOf("\n");
-      text = nl >= 0 ? text.slice(nl + 1) : "";
-    }
-    return { text, totalSize: size };
-  } catch {
-    return { text: "", totalSize: 0 };
-  } finally {
-    if (fd !== null) {
-      try {
-        fs2.closeSync(fd);
-      } catch {
-      }
-    }
-  }
-}
-function getSessionPaths(dataDir, sessionId) {
-  const brainDir = path2.join(dataDir, "brain", sessionId);
-  const systemDir = path2.join(brainDir, ".system_generated");
-  const logsDir = path2.join(systemDir, "logs");
-  const swarmDir = path2.join(systemDir, "swarm");
+function getSessionPaths(dataDir, conversationId) {
+  const brainDir = path3.join(dataDir, "brain", conversationId);
+  const systemDir = path3.join(brainDir, ".system_generated");
   return {
     brainDir,
     systemDir,
-    transcriptPath: path2.join(logsDir, "transcript.jsonl"),
-    transcriptFullPath: path2.join(logsDir, "transcript_full.jsonl"),
-    swarmDir,
-    swarmMembersPath: path2.join(swarmDir, "members.json"),
-    swarmBoardPath: path2.join(swarmDir, "board.jsonl"),
-    swarmPlanPath: path2.join(swarmDir, "plan.json"),
-    subagentsDir: path2.join(systemDir, "subagents")
+    transcriptPath: path3.join(systemDir, "logs", "transcript.jsonl"),
+    transcriptFullPath: path3.join(systemDir, "logs", "transcript_full.jsonl"),
+    swarmDir: path3.join(systemDir, "swarm"),
+    swarmMembersPath: path3.join(systemDir, "swarm", "members.json"),
+    swarmBoardPath: path3.join(systemDir, "swarm", "board.jsonl"),
+    swarmPlanPath: path3.join(systemDir, "swarm", "plan.json"),
+    subagentsDir: path3.join(systemDir, "subagents")
   };
 }
-function listSessionArtifactFiles(brainDir, { includeMeta = true } = {}) {
+function listSessionArtifactFiles(brainDir, { includeMeta = false } = {}) {
+  let entries;
   try {
-    const names = fs2.readdirSync(brainDir).filter((name) => name.endsWith(".md") && !name.startsWith(".")).sort();
-    return names.map((name) => {
-      const filePath = path2.join(brainDir, name);
-      let updatedAt = 0;
-      let size = 0;
-      try {
-        const st = fs2.statSync(filePath);
-        updatedAt = st.mtimeMs || 0;
-        size = st.size || 0;
-      } catch {
-      }
-      let summary = "";
-      if (includeMeta) {
-        const metaPath = `${filePath}.metadata.json`;
-        try {
-          const meta = JSON.parse(fs2.readFileSync(metaPath, "utf8"));
-          summary = String(meta.summary || meta.Summary || "").trim();
-        } catch {
-        }
-      }
-      return { name, path: filePath, summary, updatedAt, size };
-    });
+    entries = fs3.readdirSync(brainDir);
   } catch {
     return [];
   }
-}
-function isBoilerplatePrompt(text) {
-  const clean = String(text || "").replace(/\s+/g, " ").trim();
-  if (!clean) return true;
-  if (/^\/[a-z0-9_-]+(?:\s+\S+)?$/i.test(clean) && clean.length <= 24) return true;
-  if (clean.length <= 12) {
-    const low = clean.toLowerCase();
-    if (/^(ok|okay|yes|no|go|continue|resume|proceed|done|thanks|thx|hi|hello|ping|test|继续|好的|好|行|嗯|收到|开始|确认|ok\s*继续|继续吧|全局安装)[.!。！?？\s]*$/i.test(
-      low
-    )) {
-      return true;
-    }
-    if (clean.length <= 5) return true;
-  }
-  return false;
-}
-function extractUserPromptFromTailText(tailText, preferSubstantive) {
-  const lines = tailText.split("\n");
-  let fallbackLatest = "";
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const line = (lines[i] ?? "").trim();
-    if (!line || !line.includes('"USER_INPUT"')) continue;
+  const out = [];
+  for (const name of entries) {
+    if (!name.endsWith(".md") || name.endsWith(".resolved")) continue;
+    const fullPath = path3.join(brainDir, name);
+    let st;
     try {
-      const step = JSON.parse(line);
-      if (step && step.type === "USER_INPUT") {
-        const cleaned = cleanUserRequestText(step.content || "").replace(/\s+/g, " ").trim();
-        if (!cleaned) continue;
-        if (!fallbackLatest) fallbackLatest = cleaned;
-        if (!preferSubstantive || !isBoilerplatePrompt(cleaned)) {
-          return { best: cleaned, fallbackLatest };
-        }
-      }
+      st = fs3.statSync(fullPath);
+      if (!st.isFile()) continue;
     } catch {
+      continue;
     }
-  }
-  return { best: "", fallbackLatest };
-}
-function readLastUserPromptSnippet(transcriptPath, maxLen = 140, { preferSubstantive = false } = {}) {
-  const cached = turnsCache.get(transcriptPath);
-  if (cached && cached.sig === statSignature(transcriptPath) && cached.turns.length > 0) {
-    let fallbackLatest2 = "";
-    for (let i = cached.turns.length - 1; i >= 0; i -= 1) {
-      const turn = cached.turns[i];
-      const cleaned = turn.userText.replace(/\s+/g, " ").trim();
-      if (!cleaned) continue;
-      if (!fallbackLatest2) fallbackLatest2 = cleaned;
-      if (!preferSubstantive || !isBoilerplatePrompt(cleaned)) {
-        return cleaned.length > maxLen ? `${safeSliceChars(cleaned, maxLen - 1)}\u2026` : cleaned;
+    let summary = "";
+    let updatedAt = st.mtimeMs;
+    if (includeMeta) {
+      const metaPath = `${fullPath}.metadata.json`;
+      try {
+        const meta = JSON.parse(fs3.readFileSync(metaPath, "utf8"));
+        if (meta && typeof meta.summary === "string") summary = meta.summary.trim();
+        if (meta && meta.updatedAt) {
+          const ts = Date.parse(meta.updatedAt);
+          if (!Number.isNaN(ts)) updatedAt = ts;
+        }
+      } catch {
       }
     }
-    if (fallbackLatest2) {
-      return fallbackLatest2.length > maxLen ? `${safeSliceChars(fallbackLatest2, maxLen - 1)}\u2026` : fallbackLatest2;
-    }
-    return "";
+    out.push({ name, path: fullPath, summary, updatedAt, size: st.size });
   }
-  const first = readTailUtf8(transcriptPath, TAIL_PREVIEW_BYTES);
-  if (!first.text) return "";
-  let { best, fallbackLatest } = extractUserPromptFromTailText(first.text, preferSubstantive);
-  if (!best && first.totalSize > TAIL_PREVIEW_BYTES) {
-    const larger = readTailUtf8(transcriptPath, TAIL_FALLBACK_BYTES);
-    if (larger.text) {
-      const second = extractUserPromptFromTailText(larger.text, preferSubstantive);
-      if (second.best) best = second.best;
-      if (!fallbackLatest && second.fallbackLatest) fallbackLatest = second.fallbackLatest;
-    }
-  }
-  if (!best && !fallbackLatest && first.totalSize > TAIL_FALLBACK_BYTES) {
-    const turns = parseTranscriptTurns(transcriptPath);
-    for (let i = turns.length - 1; i >= 0; i -= 1) {
-      const cleaned = turns[i].userText.replace(/\s+/g, " ").trim();
-      if (!cleaned) continue;
-      if (!fallbackLatest) fallbackLatest = cleaned;
-      if (!preferSubstantive || !isBoilerplatePrompt(cleaned)) {
-        best = cleaned;
-        break;
-      }
-    }
-  }
-  const chosen = best || fallbackLatest;
-  if (!chosen) return "";
-  return chosen.length > maxLen ? `${safeSliceChars(chosen, maxLen - 1)}\u2026` : chosen;
+  out.sort((a, b) => b.updatedAt - a.updatedAt);
+  return out;
 }
-var SUMMARY_SELECT_SQL = [
-  "SELECT conversation_id, title, preview, step_count, last_modified_time,",
-  "workspace_uris, status, parent_conversation_id, nesting_depth, last_user_input_time",
-  "FROM conversation_summaries",
-  "ORDER BY last_modified_time DESC"
-].join(" ");
+function buildDynamicSelectSql(columns) {
+  const col = (name, fallbackExpr) => columns.has(name) ? name : `${fallbackExpr} AS ${name}`;
+  return [
+    "SELECT",
+    [
+      col("conversation_id", "''"),
+      col("title", "''"),
+      col("preview", "''"),
+      col("step_count", "0"),
+      col("last_modified_time", "''"),
+      col("workspace_uris", "'[]'"),
+      col("status", "''"),
+      col("project_id", "''"),
+      col("app_data_dir", "''"),
+      col("not_fully_idle", "0"),
+      col("parent_conversation_id", "''"),
+      col("nesting_depth", "0"),
+      col("last_user_input_time", "''")
+    ].join(", "),
+    "FROM conversation_summaries",
+    "ORDER BY last_modified_time DESC"
+  ].join(" ");
+}
 function mapDbRow(r) {
   return {
     conversationId: String(r.conversation_id ?? ""),
@@ -1127,37 +1317,57 @@ function mapDbRow(r) {
     lastModifiedTime: String(r.last_modified_time ?? ""),
     workspaceUris: typeof r.workspace_uris === "string" ? r.workspace_uris : "[]",
     status: String(r.status ?? ""),
+    projectId: String(r.project_id ?? ""),
+    appDataDir: String(r.app_data_dir ?? ""),
+    notFullyIdle: Boolean(Number(r.not_fully_idle ?? 0) || r.not_fully_idle === true),
     parentConversationId: String(r.parent_conversation_id ?? ""),
     nestingDepth: Number(r.nesting_depth ?? 0),
     lastUserInputTime: String(r.last_user_input_time ?? "")
   };
 }
-function querySummariesViaNodeSqlite(dbPath) {
+function querySummariesViaNodeSqlite(dbPath, timeoutMs) {
   const DatabaseSync = getNodeSqliteCtor();
   if (!DatabaseSync) return null;
   let db = null;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
-    const rows = db.prepare(SUMMARY_SELECT_SQL).all();
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: timeoutMs });
+    if (typeof db.exec === "function") {
+      db.exec(`PRAGMA busy_timeout = ${timeoutMs};`);
+    }
+    const colsRaw = db.prepare("PRAGMA table_info(conversation_summaries)").all();
+    const cols = new Set(colsRaw.map((c) => String(c.name ?? "")));
+    if (cols.size === 0) return null;
+    const rows = db.prepare(buildDynamicSelectSql(cols)).all();
     return Array.isArray(rows) ? rows.map(mapDbRow) : null;
   } catch {
     return null;
   } finally {
-    if (db) {
-      try {
-        db.close();
-      } catch {
-      }
+    try {
+      db?.close();
+    } catch {
     }
   }
 }
-function querySummariesViaSqliteCli(dbPath) {
-  const sql = `${SUMMARY_SELECT_SQL};`;
+function querySummariesViaSqliteCli(dbPath, timeoutMs) {
   for (const sqliteBin of SQLITE_CANDIDATES) {
     try {
-      const stdout = execFileSync(sqliteBin, ["-readonly", "-json", dbPath, sql], {
+      const colOut = execFileSync2(
+        sqliteBin,
+        ["-cmd", `.timeout ${timeoutMs}`, "-readonly", "-json", dbPath, "PRAGMA table_info(conversation_summaries);"],
+        {
+          encoding: "utf8",
+          timeout: Math.max(2500, timeoutMs + 1500),
+          maxBuffer: 1024 * 1024,
+          stdio: ["ignore", "pipe", "ignore"]
+        }
+      );
+      const colRows = JSON.parse(String(colOut || "[]").trim() || "[]");
+      const cols = new Set(colRows.map((c) => String(c.name ?? "")));
+      if (cols.size === 0) continue;
+      const sql = `${buildDynamicSelectSql(cols)};`;
+      const stdout = execFileSync2(sqliteBin, ["-cmd", `.timeout ${timeoutMs}`, "-readonly", "-json", dbPath, sql], {
         encoding: "utf8",
-        timeout: 2500,
+        timeout: Math.max(3e3, timeoutMs + 2e3),
         maxBuffer: 8 * 1024 * 1024,
         stdio: ["ignore", "pipe", "ignore"]
       });
@@ -1171,39 +1381,39 @@ function querySummariesViaSqliteCli(dbPath) {
   }
   return null;
 }
-function querySummariesViaPython(dbPath) {
+function querySummariesViaPython(dbPath, timeoutMs) {
   const pyScript = `
 import json, pathlib, sqlite3, sys
 uri = pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro"
-con = sqlite3.connect(uri, uri=True, timeout=1.0)
-rows = con.execute("""
-  SELECT conversation_id, title, preview, step_count, last_modified_time,
-         workspace_uris, status, parent_conversation_id, nesting_depth,
-         last_user_input_time
-  FROM conversation_summaries
-  ORDER BY last_modified_time DESC
-""").fetchall()
-out = []
-for r in rows:
-  out.append({
-    "conversationId": r[0] or "",
-    "title": r[1] or "",
-    "preview": r[2] or "",
-    "stepCount": int(r[3] or 0),
-    "lastModifiedTime": r[4] or "",
-    "workspaceUris": r[5] or "[]",
-    "status": r[6] or "",
-    "parentConversationId": r[7] or "",
-    "nestingDepth": int(r[8] or 0),
-    "lastUserInputTime": r[9] or "",
-  })
-print(json.dumps(out))
+con = sqlite3.connect(uri, uri=True, timeout=float(sys.argv[2]) / 1000.0)
+try:
+  cols = {r[1] for r in con.execute("PRAGMA table_info(conversation_summaries)").fetchall()}
+  def c(name, fb): return name if name in cols else f"{fb} AS {name}"
+  sql = "SELECT " + ", ".join([
+    c("conversation_id", "''"), c("title", "''"), c("preview", "''"), c("step_count", "0"),
+    c("last_modified_time", "''"), c("workspace_uris", "'[]'"), c("status", "''"),
+    c("project_id", "''"), c("app_data_dir", "''"), c("not_fully_idle", "0"),
+    c("parent_conversation_id", "''"), c("nesting_depth", "0"), c("last_user_input_time", "''")
+  ]) + " FROM conversation_summaries ORDER BY last_modified_time DESC"
+  rows = con.execute(sql).fetchall()
+  out = []
+  for r in rows:
+    out.append({
+      "conversationId": r[0] or "", "title": r[1] or "", "preview": r[2] or "",
+      "stepCount": int(r[3] or 0), "lastModifiedTime": r[4] or "", "workspaceUris": r[5] or "[]",
+      "status": r[6] or "", "projectId": r[7] or "", "appDataDir": r[8] or "",
+      "notFullyIdle": bool(r[9]), "parentConversationId": r[10] or "",
+      "nestingDepth": int(r[11] or 0), "lastUserInputTime": r[12] or ""
+    })
+  print(json.dumps(out))
+finally:
+  con.close()
 `;
   for (const inv of PYTHON_INVOCATIONS) {
     try {
-      const stdout = execFileSync(inv.bin, [...inv.prefixArgs, "-c", pyScript, dbPath], {
+      const stdout = execFileSync2(inv.bin, [...inv.prefixArgs, "-c", pyScript, dbPath, String(timeoutMs)], {
         encoding: "utf8",
-        timeout: 3e3,
+        timeout: Math.max(3e3, timeoutMs + 2e3),
         maxBuffer: 8 * 1024 * 1024,
         stdio: ["ignore", "pipe", "ignore"]
       });
@@ -1215,10 +1425,10 @@ print(json.dumps(out))
   return null;
 }
 function scanBrainDirsFallback(dataDir) {
-  const brainRoot = path2.join(dataDir, "brain");
+  const brainRoot = path3.join(dataDir, "brain");
   let dirs = [];
   try {
-    dirs = fs2.readdirSync(brainRoot);
+    dirs = fs3.readdirSync(brainRoot);
   } catch {
     return [];
   }
@@ -1226,12 +1436,12 @@ function scanBrainDirsFallback(dataDir) {
   for (const id of dirs) {
     const p = getSessionPaths(dataDir, id);
     try {
-      const subFiles = fs2.readdirSync(p.subagentsDir).filter((f) => f.endsWith(".json"));
+      const subFiles = fs3.readdirSync(p.subagentsDir).filter((f) => f.endsWith(".json"));
       for (const f of subFiles) childIds.add(f.replace(/\.json$/, ""));
     } catch {
     }
     try {
-      const members = JSON.parse(fs2.readFileSync(p.swarmMembersPath, "utf8"));
+      const members = JSON.parse(fs3.readFileSync(p.swarmMembersPath, "utf8"));
       for (const m of Object.values(members?.members || {})) {
         if (m?.conversation_id && m.conversation_id !== id) {
           childIds.add(m.conversation_id);
@@ -1246,10 +1456,10 @@ function scanBrainDirsFallback(dataDir) {
     const p = getSessionPaths(dataDir, id);
     let st = null;
     try {
-      st = fs2.statSync(p.transcriptPath);
+      st = fs3.statSync(p.transcriptPath);
     } catch {
       try {
-        st = fs2.statSync(p.brainDir);
+        st = fs3.statSync(p.brainDir);
       } catch {
         continue;
       }
@@ -1262,6 +1472,9 @@ function scanBrainDirsFallback(dataDir) {
       lastModifiedTime: new Date(st.mtimeMs).toISOString(),
       workspaceUris: "[]",
       status: "",
+      projectId: "",
+      appDataDir: path3.basename(dataDir),
+      notFullyIdle: false,
       parentConversationId: childIds.has(id) ? "inferred" : "",
       nestingDepth: childIds.has(id) ? 1 : 0,
       lastUserInputTime: ""
@@ -1271,48 +1484,65 @@ function scanBrainDirsFallback(dataDir) {
   return out;
 }
 function computeCatalogSignature(dataDir) {
-  const dbPath = path2.join(dataDir, "conversation_summaries.db");
+  const dbPath = path3.join(dataDir, "conversation_summaries.db");
   const walPath = `${dbPath}-wal`;
-  const brainRoot = path2.join(dataDir, "brain");
+  const brainRoot = path3.join(dataDir, "brain");
   return `${statSignature(dbPath)}|${statSignature(walPath)}|${statSignature(brainRoot)}`;
 }
-function loadSessionCatalog(dataDir = resolveDataDir()) {
-  const resolvedDir = path2.resolve(dataDir);
+function loadSingleRootCatalog(root) {
+  const resolvedDir = path3.resolve(root.dataDir);
   const sig = computeCatalogSignature(resolvedDir);
   const cached = catalogCache.get(resolvedDir);
   if (cached && cached.sig === sig) {
     for (const entry of cached.entries) {
-      if (!entry.hasTranscript && fs2.existsSync(entry.paths.transcriptPath)) {
+      if (!entry.hasTranscript && fs3.existsSync(entry.paths.transcriptPath)) {
         entry.hasTranscript = true;
       }
-      if (!entry.hasSwarm && (fs2.existsSync(entry.paths.swarmMembersPath) || fs2.existsSync(entry.paths.swarmBoardPath))) {
+      if (!entry.hasSwarm && (fs3.existsSync(entry.paths.swarmMembersPath) || fs3.existsSync(entry.paths.swarmBoardPath))) {
         entry.hasSwarm = true;
       }
     }
     return cached.entries;
   }
-  const dbPath = path2.join(resolvedDir, "conversation_summaries.db");
+  const dbPath = path3.join(resolvedDir, "conversation_summaries.db");
+  const timeoutMs = getBusyTimeoutMs();
   let rawRows = null;
-  if (fs2.existsSync(dbPath)) {
-    rawRows = querySummariesViaNodeSqlite(dbPath);
+  let dbReadDegraded = false;
+  if (fs3.existsSync(dbPath)) {
+    rawRows = querySummariesViaNodeSqlite(dbPath, timeoutMs);
     if (!Array.isArray(rawRows)) {
-      rawRows = querySummariesViaSqliteCli(dbPath);
+      rawRows = querySummariesViaSqliteCli(dbPath, timeoutMs);
     }
     if (!Array.isArray(rawRows)) {
-      rawRows = querySummariesViaPython(dbPath);
+      rawRows = querySummariesViaPython(dbPath, timeoutMs);
+    }
+    if (!Array.isArray(rawRows)) {
+      dbReadDegraded = true;
     }
   }
   if (!Array.isArray(rawRows)) {
     rawRows = scanBrainDirsFallback(resolvedDir);
   }
   const seen = new Set(rawRows.map((r) => r.conversationId));
-  const brainRoot = path2.join(resolvedDir, "brain");
+  const brainRoot = path3.join(resolvedDir, "brain");
+  const inferredChildIds = /* @__PURE__ */ new Set();
   try {
-    for (const id of fs2.readdirSync(brainRoot)) {
+    const allBrainIds = fs3.readdirSync(brainRoot);
+    for (const id of allBrainIds) {
+      if (id.startsWith(".")) continue;
+      const p = getSessionPaths(resolvedDir, id);
+      try {
+        for (const f of fs3.readdirSync(p.subagentsDir)) {
+          if (f.endsWith(".json")) inferredChildIds.add(f.replace(/\.json$/, ""));
+        }
+      } catch {
+      }
+    }
+    for (const id of allBrainIds) {
       if (id.startsWith(".") || seen.has(id)) continue;
       const p = getSessionPaths(resolvedDir, id);
-      if (!fs2.existsSync(p.transcriptPath)) continue;
-      const st = fs2.statSync(p.transcriptPath);
+      if (!fs3.existsSync(p.transcriptPath)) continue;
+      const st = fs3.statSync(p.transcriptPath);
       rawRows.push({
         conversationId: id,
         title: "",
@@ -1321,8 +1551,11 @@ function loadSessionCatalog(dataDir = resolveDataDir()) {
         lastModifiedTime: new Date(st.mtimeMs).toISOString(),
         workspaceUris: "[]",
         status: "",
-        parentConversationId: "",
-        nestingDepth: 0,
+        projectId: "",
+        appDataDir: path3.basename(resolvedDir),
+        notFullyIdle: false,
+        parentConversationId: inferredChildIds.has(id) ? "inferred" : "",
+        nestingDepth: inferredChildIds.has(id) ? 1 : 0,
         lastUserInputTime: ""
       });
     }
@@ -1335,12 +1568,15 @@ function loadSessionCatalog(dataDir = resolveDataDir()) {
       parseAgyTimestamp(row.lastModifiedTime),
       parseAgyTimestamp(row.lastUserInputTime)
     );
-    const hasTranscript = fs2.existsSync(paths.transcriptPath);
-    const hasSwarm = fs2.existsSync(paths.swarmMembersPath) || fs2.existsSync(paths.swarmBoardPath);
+    const hasTranscript = fs3.existsSync(paths.transcriptPath);
+    const hasSwarm = fs3.existsSync(paths.swarmMembersPath) || fs3.existsSync(paths.swarmBoardPath);
     const isChild = Boolean(row.parentConversationId) || (row.nestingDepth || 0) > 0;
+    const client = row.appDataDir ? classifyClientDir(row.appDataDir) : root.client;
+    const scopeKey = resolveScopeKey({ projectId: row.projectId, workspaces });
     return {
-      source: "agy",
-      canonicalId: `agy:${row.conversationId}`,
+      client,
+      dataDir: resolvedDir,
+      canonicalId: `${client}:${row.conversationId}`,
       sessionId: row.conversationId,
       shortId: row.conversationId.slice(0, 8),
       title: String(row.title || "").trim(),
@@ -1349,6 +1585,9 @@ function loadSessionCatalog(dataDir = resolveDataDir()) {
       updatedMs,
       workspaces,
       status: String(row.status || ""),
+      projectId: String(row.projectId || "").trim(),
+      notFullyIdle: Boolean(row.notFullyIdle),
+      scopeKey,
       isChild,
       parentConversationId: String(row.parentConversationId || ""),
       hasTranscript,
@@ -1356,49 +1595,151 @@ function loadSessionCatalog(dataDir = resolveDataDir()) {
       paths
     };
   }).sort((a, b) => b.updatedMs - a.updatedMs);
-  catalogCache.set(resolvedDir, { sig, entries });
+  if (!dbReadDegraded) {
+    catalogCache.set(resolvedDir, { sig, entries });
+  }
   return entries;
 }
-function loadFederatedCatalog(dataDir = resolveDataDir(), source = "agy") {
-  const sourceCounts = {};
-  let entries = [];
-  if (source === "agy" || source === "all") {
-    const agy = loadSessionCatalog(dataDir);
-    sourceCounts.agy = agy.length;
-    entries = entries.concat(agy);
+function loadMultiClientCatalog(overrideDir = "") {
+  const roots = discoverClientDataDirs(overrideDir);
+  const grouped = /* @__PURE__ */ new Map();
+  const clientCounts = {};
+  for (const root of roots) {
+    const list = loadSingleRootCatalog(root);
+    clientCounts[root.client] = (clientCounts[root.client] || 0) + list.length;
+    for (const entry of list) {
+      const bucket = grouped.get(entry.sessionId);
+      if (bucket) bucket.push(entry);
+      else grouped.set(entry.sessionId, [entry]);
+    }
   }
-  if (source === "codex" || source === "all") {
-    const codex = loadCodexCatalog();
-    sourceCounts.codex = codex.length;
-    entries = entries.concat(codex);
+  const merged = [];
+  for (const copies of grouped.values()) {
+    if (copies.length === 1) {
+      merged.push(copies[0]);
+      continue;
+    }
+    copies.sort((a, b) => {
+      if (b.updatedMs !== a.updatedMs) return b.updatedMs - a.updatedMs;
+      const aScore = (a.hasTranscript ? 2 : 0) + (a.projectId ? 1 : 0);
+      const bScore = (b.hasTranscript ? 2 : 0) + (b.projectId ? 1 : 0);
+      return bScore - aScore;
+    });
+    const newest = copies[0];
+    const transcriptBearing = copies.find((c) => c.hasTranscript) || newest;
+    const distinctProjectIds = new Set(copies.map((c) => c.projectId).filter(Boolean));
+    const distinctScopes = new Set(
+      copies.filter((c) => c.scopeKey.kind !== "unresolved").map((c) => formatScopeKey(c.scopeKey))
+    );
+    const hasConflict = distinctProjectIds.size > 1 || distinctScopes.size > 1;
+    const chosenProjectId = hasConflict ? "" : [...distinctProjectIds][0] || newest.projectId;
+    const chosenWorkspaces = newest.workspaces.length ? newest.workspaces : transcriptBearing.workspaces;
+    const chosenScope = hasConflict ? { kind: "unresolved", reason: "conflicting project_id across clients" } : resolveScopeKey({ projectId: chosenProjectId, workspaces: chosenWorkspaces });
+    merged.push({
+      ...newest,
+      dataDir: transcriptBearing.dataDir,
+      paths: transcriptBearing.paths,
+      hasTranscript: newest.hasTranscript || transcriptBearing.hasTranscript,
+      hasSwarm: newest.hasSwarm || transcriptBearing.hasSwarm,
+      projectId: chosenProjectId,
+      workspaces: chosenWorkspaces,
+      scopeKey: chosenScope
+    });
   }
-  if (source === "claude" || source === "all") {
-    const claude = loadClaudeCatalog();
-    sourceCounts.claude = claude.length;
-    entries = entries.concat(claude);
-  }
-  if (source === "all") {
-    entries.sort((a, b) => b.updatedMs - a.updatedMs);
-  }
-  const coverageLabel = Object.entries(sourceCounts).map(([k, v]) => `${k}:${v}`).join(", ");
-  return { entries, sourceCounts, coverageLabel };
+  const entries = merged.sort((a, b) => b.updatedMs - a.updatedMs);
+  const coverageLabel = Object.entries(clientCounts).map(([k, v]) => `${k}:${v}`).join(", ");
+  return { entries, clientCounts, coverageLabel };
 }
-function resolveSessionEntry(dataDir, sessionRef, catalog = null, sourceFilter = "agy") {
+function resolveConversationContext(opts) {
+  const cid = String(opts.conversationId || "").trim();
+  const hintWorkspaces = (opts.hintWorkspaces || []).filter(Boolean);
+  if (!isValidConversationId(cid)) {
+    return {
+      conversationId: cid,
+      client: "cli",
+      dataDir: opts.hintDataDir || resolveDataDir(opts.overrideDataDir),
+      projectId: "",
+      workspaces: hintWorkspaces,
+      scopeKey: { kind: "unresolved", reason: "invalid conversationId" },
+      diagnostic: "Invalid conversationId format."
+    };
+  }
+  const catalog = opts.catalog || loadMultiClientCatalog(opts.overrideDataDir).entries;
+  const summaryEntry = catalog.find((e) => e.sessionId === cid) || null;
+  if (summaryEntry && summaryEntry.scopeKey.kind === "unresolved" && summaryEntry.scopeKey.reason?.includes("conflicting")) {
+    return {
+      conversationId: cid,
+      client: summaryEntry.client,
+      dataDir: summaryEntry.dataDir,
+      projectId: "",
+      workspaces: summaryEntry.workspaces,
+      scopeKey: summaryEntry.scopeKey,
+      diagnostic: summaryEntry.scopeKey.reason
+    };
+  }
+  const roots = discoverClientDataDirs(opts.overrideDataDir);
+  const candidateDirs = [];
+  if (opts.hintDataDir) candidateDirs.push(path3.resolve(opts.hintDataDir));
+  if (summaryEntry?.dataDir && !candidateDirs.includes(summaryEntry.dataDir)) {
+    candidateDirs.push(summaryEntry.dataDir);
+  }
+  for (const r of roots) {
+    if (!candidateDirs.includes(r.dataDir)) candidateDirs.push(r.dataDir);
+  }
+  const observedProjectIds = /* @__PURE__ */ new Set();
+  if (summaryEntry?.projectId) observedProjectIds.add(summaryEntry.projectId);
+  let protoWorkspaces = [];
+  let protoDataDir = "";
+  for (const dir of candidateDirs) {
+    const res = readConversationDbMeta(dir, cid);
+    if (res.projectId) {
+      observedProjectIds.add(res.projectId);
+      if (!protoDataDir) protoDataDir = dir;
+    }
+    if (protoWorkspaces.length === 0 && res.workspaces.length > 0) {
+      protoWorkspaces = res.workspaces;
+    }
+  }
+  if (observedProjectIds.size > 1) {
+    return {
+      conversationId: cid,
+      client: summaryEntry?.client || classifyClientDir(protoDataDir || candidateDirs[0] || ""),
+      dataDir: summaryEntry?.dataDir || protoDataDir || candidateDirs[0] || "",
+      projectId: "",
+      workspaces: summaryEntry?.workspaces.length ? summaryEntry.workspaces : protoWorkspaces.length ? protoWorkspaces : hintWorkspaces,
+      scopeKey: { kind: "unresolved", reason: "conflicting project_id" },
+      diagnostic: `Conflicting project_id values observed for ${cid}: ${[...observedProjectIds].join(", ")}.`
+    };
+  }
+  const effectiveProjectId = [...observedProjectIds][0] || "";
+  const effectiveDataDir = summaryEntry?.dataDir || protoDataDir || candidateDirs[0] || resolveDataDir(opts.overrideDataDir);
+  const effectiveClient = summaryEntry?.client || classifyClientDir(effectiveDataDir);
+  const effectiveWorkspaces = summaryEntry?.workspaces.length ? summaryEntry.workspaces : protoWorkspaces.length ? protoWorkspaces : hintWorkspaces;
+  const scopeKey = resolveScopeKey({
+    projectId: effectiveProjectId,
+    workspaces: effectiveWorkspaces
+  });
+  return {
+    conversationId: cid,
+    client: effectiveClient,
+    dataDir: effectiveDataDir,
+    projectId: effectiveProjectId,
+    workspaces: effectiveWorkspaces,
+    scopeKey
+  };
+}
+function resolveSessionEntry(overrideDir, sessionRef, catalog = null) {
   const rawRef = String(sessionRef || "").trim();
   if (!rawRef) return { entry: null, error: "sessionId is required." };
-  const { source: explicitSource, id: bareRef } = splitCanonicalRef(rawRef);
+  const { client: explicitClient, id: bareRef } = splitClientRef(rawRef);
   const ref = bareRef.toLowerCase();
-  const effectiveSource = explicitSource || sourceFilter;
-  const list = catalog || loadFederatedCatalog(dataDir, effectiveSource).entries;
-  const scoped = explicitSource ? list.filter((s) => s.source === explicitSource) : list;
+  const list = catalog || loadMultiClientCatalog(overrideDir).entries;
+  const scoped = explicitClient ? list.filter((s) => s.client === explicitClient) : list;
   const exactMatches = scoped.filter((s) => s.sessionId.toLowerCase() === ref);
   if (exactMatches.length === 1) return { entry: exactMatches[0], error: null };
   if (exactMatches.length > 1) {
     const listStr = exactMatches.map((m) => `${m.canonicalId} (${m.title || "untitled"})`).join(", ");
-    return {
-      entry: null,
-      error: `Ambiguous session ID "${sessionRef}" across harnesses; qualify with source prefix: ${listStr}`
-    };
+    return { entry: null, error: `Ambiguous session ID "${sessionRef}"; qualify with client prefix: ${listStr}` };
   }
   if (ref.length < 4) {
     return { entry: null, error: `Session prefix "${sessionRef}" is too short (use at least 4 characters).` };
@@ -1406,13 +1747,13 @@ function resolveSessionEntry(dataDir, sessionRef, catalog = null, sourceFilter =
   const matches = scoped.filter((s) => s.sessionId.toLowerCase().startsWith(ref));
   if (matches.length === 1) return { entry: matches[0], error: null };
   if (matches.length > 1) {
-    const listStr = matches.slice(0, 5).map((m) => `${m.source === "agy" && effectiveSource === "agy" ? m.shortId : `${m.source}:${m.shortId}`} (${m.title || "untitled"})`).join(", ");
+    const listStr = matches.slice(0, 5).map((m) => `${m.shortId} (${m.title || "untitled"})`).join(", ");
     return { entry: null, error: `Ambiguous session prefix "${sessionRef}"; matches: ${listStr}` };
   }
-  return { entry: null, error: `No local conversation found matching "${sessionRef}" (source=${effectiveSource}).` };
+  return { entry: null, error: `No local conversation found matching "${sessionRef}".` };
 }
 function loadFullTranscriptStepMap(transcriptFullPath) {
-  if (!transcriptFullPath || !fs2.existsSync(transcriptFullPath)) return null;
+  if (!transcriptFullPath || !fs3.existsSync(transcriptFullPath)) return null;
   const sig = statSignature(transcriptFullPath);
   const cached = fullStepsCache.get(transcriptFullPath);
   if (cached && cached.sig === sig) {
@@ -1420,7 +1761,7 @@ function loadFullTranscriptStepMap(transcriptFullPath) {
   }
   let raw = "";
   try {
-    raw = fs2.readFileSync(transcriptFullPath, "utf8");
+    raw = fs3.readFileSync(transcriptFullPath, "utf8");
   } catch {
     return null;
   }
@@ -1454,7 +1795,7 @@ function parseTranscriptTurns(transcriptPath, { hydrateFull = false, transcriptF
   if (!baseEntry || baseEntry.sig !== sig) {
     let raw = "";
     try {
-      raw = fs2.readFileSync(transcriptPath, "utf8");
+      raw = fs3.readFileSync(transcriptPath, "utf8");
     } catch {
       return [];
     }
@@ -1574,10 +1915,10 @@ function parseTranscriptTurns(transcriptPath, { hydrateFull = false, transcriptF
   });
 }
 function parseSwarmBoardMessages(swarmBoardPath) {
-  if (!swarmBoardPath || !fs2.existsSync(swarmBoardPath)) return [];
+  if (!swarmBoardPath || !fs3.existsSync(swarmBoardPath)) return [];
   let raw = "";
   try {
-    raw = fs2.readFileSync(swarmBoardPath, "utf8");
+    raw = fs3.readFileSync(swarmBoardPath, "utf8");
   } catch {
     return [];
   }
@@ -1620,12 +1961,9 @@ function splitFileLines(content) {
   return lines;
 }
 function getSearchableSessionDoc(entry, { includeFullTranscript = true, budget } = {}) {
-  if (entry.source !== "agy") {
-    return getExternalSearchableDoc(entry, budget);
-  }
   const cacheKey = entry.canonicalId;
   const transcriptSig = entry.hasTranscript ? statSignature(entry.paths.transcriptPath) : "none";
-  const fullSig = includeFullTranscript && entry.hasTranscript && fs2.existsSync(entry.paths.transcriptFullPath) ? statSignature(entry.paths.transcriptFullPath) : "none";
+  const fullSig = includeFullTranscript && entry.hasTranscript && fs3.existsSync(entry.paths.transcriptFullPath) ? statSignature(entry.paths.transcriptFullPath) : "none";
   const boardSig = entry.hasSwarm ? statSignature(entry.paths.swarmBoardPath) : "none";
   const artifactsMeta = listSessionArtifactFiles(entry.paths.brainDir, { includeMeta: false });
   const artSig = artifactsMeta.map((a) => `${a.name}:${Math.floor(a.updatedAt)}:${a.size}`).join(",");
@@ -1639,7 +1977,7 @@ function getSearchableSessionDoc(entry, { includeFullTranscript = true, budget }
   let inFlightUserStepIndex = -1;
   if (entry.hasTranscript) {
     try {
-      const st = fs2.statSync(entry.paths.transcriptPath);
+      const st = fs3.statSync(entry.paths.transcriptPath);
       latestTranscriptMtimeMs = st.mtimeMs || 0;
       if (budget) budget.bytesRead += st.size;
     } catch (err) {
@@ -1684,7 +2022,7 @@ function getSearchableSessionDoc(entry, { includeFullTranscript = true, budget }
   const artifacts = [];
   for (const art of artifactsMeta) {
     try {
-      const content = fs2.readFileSync(art.path, "utf8");
+      const content = fs3.readFileSync(art.path, "utf8");
       if (budget) budget.bytesRead += Buffer.byteLength(content, "utf8");
       const lineCount = splitFileLines(content).length;
       const combined = `${art.name}
@@ -1716,7 +2054,6 @@ ${content}`;
   return doc;
 }
 function isSessionDocCached(entry) {
-  if (entry.source !== "agy") return isExternalDocCached(entry);
   return searchDocCache.has(entry.canonicalId);
 }
 function summarizeToolCounts(tools, maxDistinct = 4) {
@@ -1729,90 +2066,6 @@ function summarizeToolCounts(tools, maxDistinct = 4) {
   const shown = sorted.slice(0, maxDistinct).map(([name, count]) => count > 1 ? `${name}\xD7${count}` : name);
   const extra = sorted.length > maxDistinct ? `, +${sorted.length - maxDistinct} more` : "";
   return `${shown.join(", ")}${extra}`;
-}
-function listSessionsResult(opts = {}) {
-  const {
-    dataDir = resolveDataDir(),
-    source = "agy",
-    workspace = "",
-    query = "",
-    includeChildren = false,
-    excludeSessionId = "",
-    sinceHours = 0,
-    minSteps = 0,
-    limit = 15,
-    maxChars = 8200
-  } = opts;
-  const parsedSource = parseSourceFilter(source);
-  if (parsedSource.error) {
-    return { text: parsedSource.error, isError: true };
-  }
-  const safeSource = parsedSource.source;
-  const safeLimit = Math.max(1, Math.min(50, Number(limit) || 15));
-  const safeMaxChars = clampMaxChars(maxChars, 8200);
-  const safeMinSteps = Math.max(0, Number(minSteps) || 0);
-  const { entries: catalog, coverageLabel } = loadFederatedCatalog(dataDir, safeSource);
-  const now = Date.now();
-  const minMs = sinceHours > 0 ? now - sinceHours * 3600 * 1e3 : 0;
-  const queryTerms = parseQueryTokens(query);
-  const filtered = [];
-  for (const s of catalog) {
-    if (!includeChildren && s.isChild) continue;
-    if (excludeSessionId && matchesSessionId(s.sessionId, excludeSessionId, s.source)) continue;
-    if (minMs > 0 && s.updatedMs < minMs) continue;
-    if (safeMinSteps > 0 && s.stepCount < safeMinSteps) continue;
-    if (!workspaceMatches(s.workspaces, workspace)) continue;
-    let lastPrompt = "";
-    if (queryTerms.length > 0) {
-      const baseHay = `${s.source} ${s.title} ${s.preview} ${s.sessionId} ${s.workspaces.join(" ")}`.toLowerCase();
-      let matched = queryTerms.every((t) => baseHay.includes(t));
-      if (!matched && s.hasTranscript && s.source === "agy") {
-        lastPrompt = readLastUserPromptSnippet(s.paths.transcriptPath, 160, { preferSubstantive: true });
-        const extHay = `${baseHay} ${lastPrompt.toLowerCase()}`;
-        matched = queryTerms.every((t) => extHay.includes(t));
-      }
-      if (!matched) continue;
-    }
-    filtered.push({ ...s, lastPrompt });
-    if (filtered.length >= safeLimit) break;
-  }
-  if (filtered.length === 0) {
-    return {
-      text: `No matching conversations found (sources: ${coverageLabel}${workspace ? `, workspace~"${workspace}"` : ""}).`,
-      isError: false
-    };
-  }
-  const lines = [
-    `Recent conversations (${filtered.length} shown; sources: ${coverageLabel}${workspace ? `, workspace~"${workspace}"` : ""}${safeMinSteps > 0 ? `, minSteps>=${safeMinSteps}` : ""}):`,
-    ""
-  ];
-  for (const s of filtered) {
-    const snippet = s.lastPrompt || (s.hasTranscript && s.source === "agy" ? readLastUserPromptSnippet(s.paths.transcriptPath, 120, { preferSubstantive: true }) : s.preview && s.preview !== s.title ? s.preview : "");
-    const artifacts = s.source === "agy" ? listSessionArtifactFiles(s.paths.brainDir, { includeMeta: false }) : [];
-    const wsName = s.workspaces.length > 0 ? s.workspaces[0] ?? "" : "";
-    const wsLabel = wsName ? formatWorkspaceLabel(wsName) : "";
-    const badges = [];
-    if (s.source !== "agy" || safeSource === "all") badges.push(s.source);
-    if (s.hasSwarm) badges.push("swarm");
-    if (artifacts.length > 0) badges.push(`${artifacts.length} artifacts`);
-    if (s.isChild) badges.push("child");
-    const badgeStr = badges.length > 0 ? ` [${badges.join(", ")}]` : "";
-    const title = s.title || "(untitled)";
-    const meta = [
-      formatShortDate(s.updatedMs),
-      formatRelativeTime(s.updatedMs, now),
-      wsLabel,
-      s.stepCount > 0 ? `${s.stepCount} steps` : ""
-    ].filter(Boolean).join(" \xB7 ");
-    const dispId = s.source === "agy" ? s.shortId : `${s.source}:${s.shortId}`;
-    const fullId = s.source === "agy" ? s.sessionId : s.canonicalId;
-    lines.push(`- **${dispId}** (${fullId}) \u2014 ${title}${badgeStr}`);
-    lines.push(`  ${meta}`);
-    if (snippet) {
-      lines.push(`  Last user: ${snippet}`);
-    }
-  }
-  return { text: truncateUtf8(lines.join("\n"), safeMaxChars), isError: false };
 }
 function formatSwarmMode(entry, {
   tailMessages = 20,
@@ -1830,7 +2083,7 @@ function formatSwarmMode(entry, {
   const headerLines = [`Swarm for ${entry.shortId} (${entry.title || "untitled"}):`];
   let membersLoaded = false;
   try {
-    const membersObj = JSON.parse(fs2.readFileSync(entry.paths.swarmMembersPath, "utf8"));
+    const membersObj = JSON.parse(fs3.readFileSync(entry.paths.swarmMembersPath, "utf8"));
     if (membersObj?.title) headerLines.push(`Title: ${membersObj.title}`);
     const roster = Object.entries(membersObj?.members || {}).map(
       ([name, info]) => `${name} (${info.role || "worker"}, ${info.phase || "unknown"}${info.applied_model || info.model ? `, ${info.applied_model || info.model}` : ""})`
@@ -1876,18 +2129,23 @@ function formatSwarmMode(entry, {
   const limitMsgs = Math.max(1, Math.min(100, Number(tailMessages) || 20));
   const forwardFromStart = hasStartSeq && !hasEndSeq;
   const candidateSlice = forwardFromStart ? matched.slice(0, limitMsgs) : matched.slice(-limitMsgs);
-  const bodyClipLen = candidateSlice.length <= 4 ? 1400 : candidateSlice.length <= 12 ? 520 : 320;
-  const formatMsgBlock = (msg) => {
-    const body = msg.text;
-    const clipped = body.length > bodyClipLen ? `${safeSliceChars(body, bodyClipLen - 1)}\u2026` : body;
-    return `
-[#${msg.seq} ${msg.time || ""} \xB7 ${msg.agent}${msg.kind ? ` (${msg.kind})` : ""}]
-${clipped}`;
-  };
-  const reserveForSummaryAndFooter = 240;
+  const reserveForSummaryAndFooter = 280;
   const headerText = headerLines.join("\n");
   const maxBodyChars = Math.max(400, safeMaxChars - headerText.length - reserveForSummaryAndFooter);
   const maxBodyBytes = Math.max(400, 8650 - Buffer.byteLength(headerText, "utf8") - reserveForSummaryAndFooter);
+  const bodyClipLen = candidateSlice.length === 1 ? maxBodyChars : candidateSlice.length <= 4 ? Math.max(1600, Math.floor((maxBodyChars - candidateSlice.length * 90) / candidateSlice.length)) : candidateSlice.length <= 12 ? 900 : 480;
+  const formatMsgBlock = (msg) => {
+    const body = msg.text;
+    const msgHeader = `
+[#${msg.seq} ${msg.time || ""} \xB7 ${msg.agent}${msg.kind ? ` (${msg.kind})` : ""}]
+`;
+    const effectiveClip = Math.max(200, bodyClipLen - msgHeader.length);
+    if (body.length <= effectiveClip) {
+      return `${msgHeader}${body}`;
+    }
+    const hint = candidateSlice.length === 1 ? `\u2026 [clipped at ${effectiveClip}/${body.length} chars; full board: ${entry.paths.swarmBoardPath}]` : `\u2026 [clipped at ${effectiveClip}/${body.length} chars; pass startSeq=${msg.seq} endSeq=${msg.seq} for full message]`;
+    return `${msgHeader}${safeSliceChars(body, Math.max(120, effectiveClip - hint.length))}${hint}`;
+  };
   const chosen = [];
   let usedChars = 0;
   let usedBytes = 0;
@@ -1953,15 +2211,14 @@ function formatArtifactsMode(entry, artifacts, {
     for (const a of artifacts) {
       let lineCount = 0;
       try {
-        const content = fs2.readFileSync(a.path, "utf8");
-        lineCount = splitFileLines(content).length;
+        lineCount = splitFileLines(fs3.readFileSync(a.path, "utf8")).length;
       } catch {
       }
       out.push(`- ${a.name} (${lineCount} lines, ${a.size} B) \u2014 Path: ${a.path}`);
       if (a.summary) out.push(`  ${(a.summary.split("\n")[0] ?? "").slice(0, 180)}`);
     }
     out.push(
-      "\nTip: For full reads of large Markdown artifacts (>100 lines), call built-in read_file(Path) directly (46 KB inline) or pass artifactName + startLine/endLine."
+      "\nTip: For full reads of large Markdown artifacts (>100 lines), call built-in read_file(Path) directly or pass artifactName + startLine/endLine."
     );
     return { text: truncateUtf8(out.join("\n"), safeMaxChars), isError: false };
   }
@@ -1974,7 +2231,7 @@ function formatArtifactsMode(entry, artifacts, {
       isError: true
     };
   }
-  const allLines = splitFileLines(fs2.readFileSync(target.path, "utf8"));
+  const allLines = splitFileLines(fs3.readFileSync(target.path, "utf8"));
   const totalLines = allLines.length;
   const sLine = Math.max(1, Math.floor(Number(startLine) || 1));
   if (sLine > totalLines) {
@@ -2019,8 +2276,7 @@ ${renderedLines.join("\n")}${footer}`, safeMaxChars),
 }
 function readSessionResult(opts = {}) {
   const {
-    dataDir = resolveDataDir(),
-    source = "agy",
+    dataDir = "",
     sessionId = "",
     mode = "digest",
     startStep = null,
@@ -2038,10 +2294,6 @@ function readSessionResult(opts = {}) {
     charOffset = 0,
     maxChars = 8200
   } = opts;
-  const parsedSource = parseSourceFilter(source);
-  if (parsedSource.error) {
-    return { text: parsedSource.error, isError: true };
-  }
   const safeMode = String(mode || "digest").trim().toLowerCase();
   if (!VALID_READ_MODES.has(safeMode)) {
     return {
@@ -2050,11 +2302,11 @@ function readSessionResult(opts = {}) {
     };
   }
   const safeMaxChars = clampMaxChars(maxChars, 8200);
-  const { entry, error } = resolveSessionEntry(dataDir, sessionId, null, parsedSource.source);
+  const { entry, error } = resolveSessionEntry(dataDir, sessionId, null);
   if (error || !entry) {
     return { text: `Error: ${error || "Session not found."}`, isError: true };
   }
-  const artifacts = entry.source === "agy" ? listSessionArtifactFiles(entry.paths.brainDir, { includeMeta: safeMode === "artifacts" }) : [];
+  const artifacts = listSessionArtifactFiles(entry.paths.brainDir, { includeMeta: safeMode === "artifacts" });
   const wsStr = entry.workspaces.join(", ") || "(unknown)";
   if (safeMode === "artifacts") {
     return formatArtifactsMode(entry, artifacts, { artifactName, startLine, endLine, safeMaxChars });
@@ -2062,20 +2314,20 @@ function readSessionResult(opts = {}) {
   if (safeMode === "swarm") {
     return formatSwarmMode(entry, { tailMessages, startSeq, endSeq, query, safeMaxChars });
   }
-  const turns = entry.source === "agy" ? parseTranscriptTurns(entry.paths.transcriptPath, {
+  const turns = parseTranscriptTurns(entry.paths.transcriptPath, {
     hydrateFull: safeMode === "turns",
     transcriptFullPath: entry.paths.transcriptFullPath
-  }) : parseExternalTurns(entry);
+  });
   if (turns.length === 0) {
     return {
-      text: `Session ${entry.source === "agy" ? entry.shortId : entry.canonicalId} (${entry.title || "untitled"}) has no readable transcript turns yet.`,
+      text: `Session ${entry.shortId} (${entry.title || "untitled"}) has no readable transcript turns yet.`,
       isError: false
     };
   }
   const firstStep = turns[0].startStep;
   const lastStep = turns[turns.length - 1].endStep;
   const headerLines = [
-    `Session: ${entry.source === "agy" ? entry.sessionId : entry.canonicalId} (source=${entry.source})`,
+    `Session: ${entry.sessionId} (client=${entry.client}, scope=${formatScopeKey(entry.scopeKey)})`,
     `Title: ${entry.title || "(untitled)"}`,
     `Workspace: ${wsStr}`,
     `Updated: ${formatShortDate(entry.updatedMs)} (${formatRelativeTime(entry.updatedMs)}) \xB7 Turns: ${turns.length} \xB7 Steps: #${firstStep}-#${lastStep} (${entry.stepCount || lastStep + 1} total)`
@@ -2086,7 +2338,7 @@ function readSessionResult(opts = {}) {
   }
   if (entry.hasSwarm) {
     try {
-      const m = JSON.parse(fs2.readFileSync(entry.paths.swarmMembersPath, "utf8"));
+      const m = JSON.parse(fs3.readFileSync(entry.paths.swarmMembersPath, "utf8"));
       const names = Object.keys(m?.members || {}).filter((n) => n !== "coordinator");
       headerLines.push(`Swarm: "${m?.title || ""}" (${names.length} workers: ${names.slice(0, 8).join(", ")})`);
     } catch {
@@ -2142,10 +2394,9 @@ Turn ${t.turnIndex} (#${t.startStep}-${t.endStep}${timeTag})${toolTag}:`];
         const middleCandidates = [];
         for (let i = headCount; i < turns.length - tailCount; i += 1) {
           const t = turns[i];
-          const substantiveUser = t.userText && !isBoilerplatePrompt(t.userText) ? 20 : 0;
           const replySignal = Math.min(40, Math.floor(t.finalAssistantText.length / 40));
           const toolSignal = Math.min(30, t.tools.length * 3);
-          const signal = substantiveUser + replySignal + toolSignal;
+          const signal = (t.userText ? 15 : 0) + replySignal + toolSignal;
           if (signal > 0) {
             middleCandidates.push({ idx: i, signal, rendered: formatDigestTurn(t) });
           }
@@ -2177,10 +2428,9 @@ Turn ${t.turnIndex} (#${t.startStep}-${t.endStep}${timeTag})${toolTag}:`];
         out.push(formatDigestTurn(turns[idx]));
         prevIdx = idx;
       }
-      const tipId = entry.source === "agy" ? entry.shortId : `${entry.source}:${entry.shortId}`;
       out.push(
         `
-Tip: use search_sessions(sessionId="${tipId}", query="...") to jump to specific topics, or read_session(sessionId="${tipId}", mode="turns", startStep=..., endStep=...).`
+Tip: use search_sessions(sessionId="${entry.shortId}", query="...") to jump to specific topics, or read_session(sessionId="${entry.shortId}", mode="turns", startStep=..., endStep=...).`
       );
     }
     return { text: truncateUtf8(out.join("\n"), safeMaxChars), isError: false };
@@ -2270,808 +2520,155 @@ ${slicedBody}`;
 ${chunk.trimEnd()}${footer}`, isError: false };
 }
 
-// src/analytics.ts
-var AGY_MEMORY_TOOL_RE = /^(?:mcp_)?agy-memory_memory_([a-z_]+)$/;
-var RAW_BRAIN_SHELL_RE = /(?:\.gemini[\\/]+antigravity(?:-cli)?[\\/]+brain|conversation_summaries\.db|transcript(?:_full)?\.jsonl|board\.jsonl)/i;
-function parseArgsObj(raw) {
-  if (!raw) return {};
-  if (typeof raw === "object" && !Array.isArray(raw)) {
-    return raw;
-  }
-  try {
-    const parsed = JSON.parse(String(raw));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-function emptyBucket() {
-  return {
-    sessions: 0,
-    sessionsWithSnapshot: 0,
-    sessionsWithMemoryTools: 0,
-    llmTurns: 0,
-    totalToolCalls: 0,
-    memoryToolCalls: {
-      list_sessions: 0,
-      search_sessions: 0,
-      read_session: 0,
-      save_note: 0,
-      recall_notes: 0
-    },
-    rawBrainReads: 0,
-    mcpSpills: 0,
-    budgetTruncations: 0,
-    toolErrors: 0,
-    uncachedInputTokens: 0,
-    cacheReadTokens: 0,
-    outputTokens: 0
-  };
-}
-function isMemoryToolKey(key) {
-  return key === "list_sessions" || key === "search_sessions" || key === "read_session" || key === "save_note" || key === "recall_notes";
-}
-function analyzeSingleTranscript(transcriptPath) {
-  let raw = "";
-  try {
-    raw = fs3.readFileSync(transcriptPath, "utf8");
-  } catch {
-    return null;
-  }
-  const s = emptyBucket();
-  s.sessions = 1;
-  let hasSnapshot = false;
-  let usedMemory = false;
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let step;
-    try {
-      step = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    const content = typeof step.content === "string" ? step.content : "";
-    if (content.includes("[agy-memory]")) {
-      hasSnapshot = true;
-    }
-    if (step.type === "PLANNER_RESPONSE") {
-      s.llmTurns += 1;
-      s.uncachedInputTokens += Number(step.input_tokens || 0);
-      s.cacheReadTokens += Number(step.cache_read_tokens || 0);
-      s.outputTokens += Number(step.output_tokens || 0);
-      const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
-      s.totalToolCalls += calls.length;
-      for (const tc of calls) {
-        const name = String(tc?.name || "");
-        const args = parseArgsObj(tc?.arguments ?? tc?.args);
-        const m = AGY_MEMORY_TOOL_RE.exec(name);
-        if (m && m[1]) {
-          usedMemory = true;
-          if (isMemoryToolKey(m[1])) {
-            s.memoryToolCalls[m[1]] += 1;
-          }
-          continue;
-        }
-        if (name === "run_command") {
-          const cmd = String(args.CommandLine || args.command || "");
-          if (RAW_BRAIN_SHELL_RE.test(cmd)) s.rawBrainReads += 1;
-        } else if (name === "read_file") {
-          const p = String(args.Path || args.path || "");
-          if (RAW_BRAIN_SHELL_RE.test(p)) s.rawBrainReads += 1;
-        }
-      }
-    } else if (step.type === "GENERIC") {
-      if (content.includes("The tool's output was truncated due to being too long.")) {
-        s.mcpSpills += 1;
-      }
-      if (content.includes("\u2026 [truncated")) {
-        s.budgetTruncations += 1;
-      }
-      if (step.status === "ERROR" || /^Error:/m.test(content)) {
-        s.toolErrors += 1;
-      }
-    }
-  }
-  if (hasSnapshot) s.sessionsWithSnapshot = 1;
-  if (usedMemory) s.sessionsWithMemoryTools = 1;
-  return s;
-}
-function mergeBucket(dst, src) {
-  dst.sessions += src.sessions;
-  dst.sessionsWithSnapshot += src.sessionsWithSnapshot;
-  dst.sessionsWithMemoryTools += src.sessionsWithMemoryTools;
-  dst.llmTurns += src.llmTurns;
-  dst.totalToolCalls += src.totalToolCalls;
-  dst.memoryToolCalls.list_sessions += src.memoryToolCalls.list_sessions;
-  dst.memoryToolCalls.search_sessions += src.memoryToolCalls.search_sessions;
-  dst.memoryToolCalls.read_session += src.memoryToolCalls.read_session;
-  dst.memoryToolCalls.save_note += src.memoryToolCalls.save_note;
-  dst.memoryToolCalls.recall_notes += src.memoryToolCalls.recall_notes;
-  dst.rawBrainReads += src.rawBrainReads;
-  dst.mcpSpills += src.mcpSpills;
-  dst.budgetTruncations += src.budgetTruncations;
-  dst.toolErrors += src.toolErrors;
-  dst.uncachedInputTokens += src.uncachedInputTokens;
-  dst.cacheReadTokens += src.cacheReadTokens;
-  dst.outputTokens += src.outputTokens;
-}
-function finalizeBucket(b) {
-  const memTotal = b.memoryToolCalls.list_sessions + b.memoryToolCalls.search_sessions + b.memoryToolCalls.read_session + b.memoryToolCalls.save_note + b.memoryToolCalls.recall_notes;
-  const estBillableEquiv = Math.round(b.uncachedInputTokens + 0.1 * b.cacheReadTokens + 5 * b.outputTokens);
-  const avgTurns = b.sessions > 0 ? Number((b.llmTurns / b.sessions).toFixed(2)) : 0;
-  return {
-    ...b,
-    memoryToolCallsTotal: memTotal,
-    avgTurnsPerSession: avgTurns,
-    estBillableEquiv
-  };
-}
-function analyzeMemoryUsage(opts = {}) {
-  const { dataDir = resolveDataDir(), recent = 50, includeChildren = false } = opts;
-  const catalog = loadSessionCatalog(dataDir).filter(
-    (entry) => entry.hasTranscript && (includeChildren || !entry.isChild)
-  );
-  const limit = Math.max(1, Math.min(500, Number(recent) || 50));
-  const selected = catalog.slice(0, limit);
-  const overall = emptyBucket();
-  const withMemory = emptyBucket();
-  const withoutMemory = emptyBucket();
-  for (const entry of selected) {
-    const stat = analyzeSingleTranscript(entry.paths.transcriptPath);
-    if (!stat) continue;
-    mergeBucket(overall, stat);
-    if (stat.sessionsWithMemoryTools > 0 || stat.sessionsWithSnapshot > 0) {
-      mergeBucket(withMemory, stat);
-    } else {
-      mergeBucket(withoutMemory, stat);
-    }
-  }
-  return {
-    dataDir: path3.resolve(dataDir),
-    analyzedLimit: limit,
-    overall: finalizeBucket(overall),
-    withAgyMemory: finalizeBucket(withMemory),
-    withoutAgyMemory: finalizeBucket(withoutMemory)
-  };
-}
-function formatMemoryUsageMarkdown(report) {
-  const { overall: o, withAgyMemory: w, withoutAgyMemory: wo } = report;
-  const tc = o.memoryToolCalls;
-  const rows = [
-    "# agy-memory Offline Transcript Analytics",
-    "",
-    `- Data dir: \`${report.dataDir}\``,
-    `- Recent root sessions analyzed: ${o.sessions} (limit ${report.analyzedLimit})`,
-    "",
-    "| Metric | Overall | Without agy-memory | With agy-memory |",
-    "| :--- | ---: | ---: | ---: |",
-    `| Sessions | ${o.sessions} | ${wo.sessions} | ${w.sessions} |`,
-    `| Sessions with snapshot | ${o.sessionsWithSnapshot} | 0 | ${w.sessionsWithSnapshot} |`,
-    `| Sessions calling agy-memory tools | ${o.sessionsWithMemoryTools} | 0 | ${w.sessionsWithMemoryTools} |`,
-    `| LLM turns (avg/session) | ${o.llmTurns} (${o.avgTurnsPerSession}) | ${wo.llmTurns} (${wo.avgTurnsPerSession}) | ${w.llmTurns} (${w.avgTurnsPerSession}) |`,
-    `| Total tool calls | ${o.totalToolCalls} | ${wo.totalToolCalls} | ${w.totalToolCalls} |`,
-    `| agy-memory calls | ${o.memoryToolCallsTotal} (list:${tc.list_sessions}, search:${tc.search_sessions}, read:${tc.read_session}, save:${tc.save_note}, recall:${tc.recall_notes}) | 0 | ${w.memoryToolCallsTotal} |`,
-    `| Raw brain transcript shell/read calls | ${o.rawBrainReads} | ${wo.rawBrainReads} | ${w.rawBrainReads} |`,
-    `| Disk spills / budget truncs / errors | ${o.mcpSpills} / ${o.budgetTruncations} / ${o.toolErrors} | ${wo.mcpSpills} / ${wo.budgetTruncations} / ${wo.toolErrors} | ${w.mcpSpills} / ${w.budgetTruncations} / ${w.toolErrors} |`,
-    `| Est. billable equiv tokens | ${o.estBillableEquiv.toLocaleString("en-US")} | ${wo.estBillableEquiv.toLocaleString("en-US")} | ${w.estBillableEquiv.toLocaleString("en-US")} |`
-  ];
-  return rows.join("\n");
-}
+// src/search.ts
+import { execFileSync as execFileSync3 } from "node:child_process";
+import fs6 from "node:fs";
 
-// src/notes.ts
-import crypto from "node:crypto";
+// src/stream.ts
 import fs4 from "node:fs";
 import path4 from "node:path";
-var INDEX_START = "<!-- agy-memory:index:start -->";
-var INDEX_END = "<!-- agy-memory:index:end -->";
-var MAX_INDEX_LINES = 150;
-var FRONTMATTER_SCHEMA_VERSION = 1;
-var VALID_NOTE_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
-var LOCK_TIMEOUT_MS = 1500;
-var STALE_LOCK_MS = 1e4;
-function getNotesPath(dataDir = resolveDataDir()) {
-  return path4.join(dataDir, "plugin_data", "agy-memory", "notes.json");
-}
-function getMemoryDir(dataDir = resolveDataDir()) {
-  return path4.join(dataDir, "plugin_data", "agy-memory", "memory");
-}
-function getMemoryIndexPath(dataDir = resolveDataDir()) {
-  return path4.join(getMemoryDir(dataDir), "MEMORY.md");
-}
-function getTopicsDir(dataDir = resolveDataDir()) {
-  return path4.join(getMemoryDir(dataDir), "topics");
-}
-function isValidNoteId(id) {
-  return VALID_NOTE_ID_RE.test(id);
-}
-function getTopicFilePath(dataDir, validatedId) {
-  if (!isValidNoteId(validatedId)) {
-    throw new Error(`Invalid note ID "${validatedId}". Use 1-64 ASCII letters, digits, '_' or '-' starting with a letter/digit.`);
-  }
-  return path4.join(getTopicsDir(dataDir), `${validatedId}.md`);
-}
-function computeRevision(raw) {
-  return crypto.createHash("sha256").update(raw, "utf8").digest("hex").slice(0, 12);
-}
-function writeTextAtomic(filePath, payload) {
-  const dir = path4.dirname(filePath);
-  fs4.mkdirSync(dir, { recursive: true, mode: 448 });
-  const tmpPath = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
-  try {
-    fs4.writeFileSync(tmpPath, payload, { encoding: "utf8", mode: 384, flag: "wx" });
-    fs4.renameSync(tmpPath, filePath);
-  } catch (err) {
-    try {
-      fs4.unlinkSync(tmpPath);
-    } catch {
-    }
-    throw err;
-  }
-}
-function sleepSync(ms) {
-  const sab = new SharedArrayBuffer(4);
-  const ia = new Int32Array(sab);
-  Atomics.wait(ia, 0, 0, ms);
-}
-function withNotesLock(dataDir, fn) {
-  const memDir = getMemoryDir(dataDir);
-  fs4.mkdirSync(memDir, { recursive: true, mode: 448 });
-  const lockPath = path4.join(memDir, ".notes.lock");
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
-  let acquired = false;
-  while (!acquired) {
-    try {
-      const fd = fs4.openSync(lockPath, "wx", 384);
-      fs4.writeSync(fd, `${process.pid}:${Date.now()}
-`);
-      fs4.closeSync(fd);
-      acquired = true;
-    } catch (err) {
-      const code = err?.code;
-      if (code !== "EEXIST") throw err;
-      try {
-        const st = fs4.statSync(lockPath);
-        if (Date.now() - st.mtimeMs > STALE_LOCK_MS) {
-          fs4.unlinkSync(lockPath);
-          continue;
-        }
-      } catch {
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for notes lock (${lockPath}); retry after concurrent write completes.`);
-      }
-      sleepSync(15);
-    }
-  }
-  try {
-    return fn();
-  } finally {
-    try {
-      fs4.unlinkSync(lockPath);
-    } catch {
-    }
-  }
-}
-function normalizeTagsInput(rawTags) {
-  let list = [];
-  if (Array.isArray(rawTags)) {
-    list = rawTags;
-  } else if (typeof rawTags === "string" && rawTags.trim()) {
-    list = rawTags.split(",");
-  }
-  return [...new Set(list.map((t) => String(t ?? "").trim().toLowerCase()).filter(Boolean))];
-}
-function serializeTopicMarkdown(note) {
-  const fm = [
-    "---",
-    `schema: ${FRONTMATTER_SCHEMA_VERSION}`,
-    `id: ${JSON.stringify(note.id)}`,
-    `topic: ${JSON.stringify(note.topic)}`,
-    `workspace: ${JSON.stringify(note.workspace || "")}`,
-    `tags: ${JSON.stringify(note.tags || [])}`,
-    `sessionId: ${JSON.stringify(note.sessionId || "")}`,
-    `createdAt: ${Number(note.createdAt) || Date.now()}`,
-    `updatedAt: ${Number(note.updatedAt) || Date.now()}`,
-    "---"
-  ].join("\n");
-  return `${fm}
-
-${note.content.replace(/^\n+/, "").trimEnd()}
-`;
-}
-function parseFrontmatterValue(rawVal) {
-  const v = rawVal.trim();
-  if (!v) return { value: "", error: null };
-  if (v.startsWith('"') || v.startsWith("[") || v.startsWith("{")) {
-    try {
-      return { value: JSON.parse(v), error: null };
-    } catch {
-      return { value: null, error: `Malformed JSON-quoted frontmatter value: ${v.slice(0, 60)}` };
-    }
-  }
-  if (v === "true") return { value: true, error: null };
-  if (v === "false") return { value: false, error: null };
-  if (v === "null") return { value: null, error: null };
-  if (/^-?\d+(?:\.\d+)?$/.test(v)) return { value: Number(v), error: null };
-  if (v.startsWith("'") && v.endsWith("'") && v.length >= 2) {
-    return { value: v.slice(1, -1).replace(/''/g, "'"), error: null };
-  }
-  return { value: v, error: null };
-}
-function parseTopicMarkdown(raw, filePath) {
-  const normalized = raw.replace(/\r\n/g, "\n");
-  if (!normalized.startsWith("---\n")) {
-    return { note: null, error: `Malformed frontmatter (missing opening ---) in ${filePath}` };
-  }
-  const endIdx = normalized.indexOf("\n---\n", 4);
-  const endIdxEof = endIdx === -1 && normalized.endsWith("\n---") ? normalized.length - 4 : endIdx;
-  if (endIdxEof < 0) {
-    return { note: null, error: `Malformed frontmatter (missing closing ---) in ${filePath}` };
-  }
-  const headerLines = normalized.slice(4, endIdxEof).split("\n");
-  const rawBody = endIdx >= 0 ? normalized.slice(endIdx + 5) : "";
-  const body = rawBody.replace(/^\n+/, "").trimEnd();
-  const meta = {};
-  for (const line of headerLines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const colon = line.indexOf(":");
-    if (colon <= 0) {
-      return { note: null, error: `Invalid frontmatter line "${trimmed}" in ${filePath}` };
-    }
-    const key = line.slice(0, colon).trim();
-    const parsed = parseFrontmatterValue(line.slice(colon + 1));
-    if (parsed.error) {
-      return { note: null, error: `${parsed.error} in ${filePath}` };
-    }
-    meta[key] = parsed.value;
-  }
-  const schemaVer = Number(meta.schema);
-  if (meta.schema !== void 0 && (!Number.isInteger(schemaVer) || schemaVer !== FRONTMATTER_SCHEMA_VERSION)) {
-    return { note: null, error: `Unsupported frontmatter schema "${String(meta.schema)}" in ${filePath}` };
-  }
-  const id = String(meta.id || "").trim();
-  const topic = String(meta.topic || "").trim();
-  if (!id || !topic) {
-    return { note: null, error: `Missing required frontmatter id/topic in ${filePath}` };
-  }
-  if (!isValidNoteId(id)) {
-    return { note: null, error: `Invalid frontmatter id "${id}" in ${filePath}` };
-  }
-  if (!body.trim()) {
-    return { note: null, error: `Empty note body in ${filePath}` };
-  }
-  let stMtime = Date.now();
-  try {
-    stMtime = Math.round(fs4.statSync(filePath).mtimeMs);
-  } catch {
-  }
-  const note = {
-    id,
-    topic,
-    content: body,
-    workspace: String(meta.workspace || "").trim(),
-    tags: normalizeTagsInput(meta.tags),
-    sessionId: String(meta.sessionId || "").trim(),
-    createdAt: Number(meta.createdAt) || stMtime,
-    updatedAt: Number(meta.updatedAt) || stMtime,
-    filePath,
-    revision: computeRevision(raw)
+var CHUNK_BYTES = 64 * 1024;
+function createScanBudget(maxScanBytes = 32 * 1024 * 1024, maxScanMs = 2500) {
+  return {
+    maxScanBytes,
+    maxScanMs,
+    startedAtMs: Date.now(),
+    bytesRead: 0,
+    sessionsScanned: 0,
+    incomplete: false,
+    reason: ""
   };
-  return { note, error: null };
 }
-function rebuildMemoryIndexFile(dataDir, notes) {
-  const indexPath = getMemoryIndexPath(dataDir);
-  const sorted = [...notes].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  const indexRows = [
-    INDEX_START,
-    `<!-- Auto-maintained index (${sorted.length} notes; topics/*.md files are authoritative) -->`
-  ];
-  const maxRows = Math.max(10, MAX_INDEX_LINES - 12);
-  for (const n of sorted.slice(0, maxRows)) {
-    const ws = n.workspace ? ` \xB7 ${formatWorkspaceLabel(n.workspace)}` : "";
-    const tags = n.tags.length > 0 ? ` [${n.tags.join(", ")}]` : "";
-    const preview = n.content.replace(/\s+/g, " ").trim();
-    const shortPrev = preview.length > 100 ? `${safeSliceChars(preview, 99)}\u2026` : preview;
-    const relName = n.filePath ? path4.basename(n.filePath) : `${n.id}.md`;
-    indexRows.push(`- **[${n.id}] ${n.topic}**${tags}${ws} \u2192 \`topics/${relName}\` \u2014 ${shortPrev}`);
+function checkScanBudget(budget) {
+  if (!budget) return true;
+  if (budget.incomplete) return false;
+  if (budget.bytesRead >= budget.maxScanBytes) {
+    budget.incomplete = true;
+    budget.reason = `byte budget (${Math.round(budget.maxScanBytes / (1024 * 1024))} MB) reached`;
+    return false;
   }
-  if (sorted.length > maxRows) {
-    indexRows.push(`- \u2026 (${sorted.length - maxRows} additional note(s) in \`topics/\`; use \`recall_notes\` to query all)`);
+  if (Date.now() - budget.startedAtMs >= budget.maxScanMs) {
+    budget.incomplete = true;
+    budget.reason = `time budget (${budget.maxScanMs} ms) reached`;
+    return false;
   }
-  indexRows.push(INDEX_END);
-  const managedBlock = indexRows.join("\n");
-  let finalDoc = `# agy-memory Index
-
-Add personal notes above or below the managed markers; topic files in \`topics/\` are authoritative.
-
-${managedBlock}
-`;
-  if (fs4.existsSync(indexPath)) {
-    try {
-      const existing = fs4.readFileSync(indexPath, "utf8").replace(/\r\n/g, "\n");
-      const sIdx = existing.indexOf(INDEX_START);
-      const eIdx = existing.indexOf(INDEX_END);
-      if (sIdx >= 0 && eIdx > sIdx) {
-        finalDoc = `${existing.slice(0, sIdx)}${managedBlock}${existing.slice(eIdx + INDEX_END.length)}`;
-      } else if (existing.trim()) {
-        finalDoc = `${existing.trimEnd()}
-
-${managedBlock}
-`;
-      }
-    } catch {
-    }
-  }
-  writeTextAtomic(indexPath, finalDoc);
+  return true;
 }
-function sanitizeLegacyNoteId(rawId) {
-  const trimmed = String(rawId || "").trim();
-  if (isValidNoteId(trimmed)) return trimmed;
-  const hash = crypto.createHash("sha256").update(trimmed || crypto.randomBytes(8).toString("hex")).digest("hex").slice(0, 8);
-  const prefix = trimmed.replace(/[^a-zA-Z0-9_-]/g, "").replace(/^[^a-zA-Z0-9]+/, "").slice(0, 48);
-  return prefix ? `${prefix}-${hash}` : `note-${hash}`;
-}
-function readTopicsFromDisk(dataDir, warnings) {
-  const topicsDir = getTopicsDir(dataDir);
-  if (!fs4.existsSync(topicsDir)) return [];
-  const notes = [];
-  const seenIds = /* @__PURE__ */ new Map();
-  let entries = [];
+function streamJsonlFromOffset(filePath, startOffset, onLine, budget) {
+  let fd = null;
   try {
-    entries = fs4.readdirSync(topicsDir).filter((f) => f.endsWith(".md") && !f.startsWith(".")).sort();
-  } catch {
-    return [];
-  }
-  for (const name of entries) {
-    const filePath = path4.join(topicsDir, name);
-    try {
-      const raw = fs4.readFileSync(filePath, "utf8");
-      const { note, error } = parseTopicMarkdown(raw, filePath);
-      if (error || !note) {
-        warnings.push(error || `Unreadable topic note: ${filePath}`);
-        continue;
-      }
-      if (seenIds.has(note.id)) {
-        warnings.push(`Duplicate note ID "${note.id}" in ${filePath} (already defined in ${seenIds.get(note.id)})`);
-        continue;
-      }
-      seenIds.set(note.id, filePath);
-      notes.push(note);
-    } catch {
-      warnings.push(`Could not read topic note: ${filePath}`);
+    fd = fs4.openSync(filePath, "r");
+    const st = fs4.fstatSync(fd);
+    const size = st.size;
+    const mtimeMs = st.mtimeMs;
+    let pos = Math.max(0, startOffset);
+    if (pos >= size) {
+      return { newOffset: size, eof: true, size, mtimeMs, ioError: false };
     }
-  }
-  return notes;
-}
-function loadLegacyJsonNotesReadOnly(dataDir) {
-  const filePath = getNotesPath(dataDir);
-  const warnings = [];
-  if (!fs4.existsSync(filePath)) return { notes: [], warnings };
-  try {
-    const parsed = JSON.parse(fs4.readFileSync(filePath, "utf8"));
-    const notes = Array.isArray(parsed?.notes) ? parsed.notes : [];
-    return { notes, warnings };
-  } catch {
-    warnings.push(`Malformed legacy notes file preserved untouched: ${filePath}`);
-    return { notes: [], warnings };
-  }
-}
-function maybeMigrateLegacyNotesJson(dataDir, warnings) {
-  const legacyPath = getNotesPath(dataDir);
-  if (!fs4.existsSync(legacyPath)) return;
-  const markerPath = path4.join(getMemoryDir(dataDir), ".migrated_v1_json");
-  if (fs4.existsSync(markerPath)) return;
-  withNotesLock(dataDir, () => {
-    if (fs4.existsSync(markerPath)) return;
-    let legacyNotes = [];
-    try {
-      const parsed = JSON.parse(fs4.readFileSync(legacyPath, "utf8"));
-      if (!Array.isArray(parsed?.notes)) {
-        warnings.push(`Legacy ${legacyPath} has invalid structure; preserved untouched.`);
-        return;
+    const buf = Buffer.allocUnsafe(CHUNK_BYTES);
+    let carryParts = [];
+    let carryLen = 0;
+    let consumedBytes = pos;
+    while (pos < size) {
+      if (budget && !checkScanBudget(budget)) {
+        return { newOffset: consumedBytes, eof: false, size, mtimeMs, ioError: false };
       }
-      legacyNotes = parsed.notes;
-    } catch {
-      warnings.push(`Legacy ${legacyPath} could not be parsed as JSON; preserved untouched.`);
-      return;
-    }
-    const topicsDir = getTopicsDir(dataDir);
-    fs4.mkdirSync(topicsDir, { recursive: true, mode: 448 });
-    let allVerified = true;
-    let migratedAny = false;
-    for (let i = 0; i < legacyNotes.length; i += 1) {
-      const raw = legacyNotes[i];
-      const topic = String(raw.topic || "").trim();
-      const content = String(raw.content || "").replace(/^\n+/, "").trimEnd();
-      if (!topic || !content.trim()) {
-        allVerified = false;
-        warnings.push(`Legacy note #${i + 1} has empty topic/content; legacy notes.json retained for inspection.`);
-        continue;
-      }
-      const id = sanitizeLegacyNoteId(String(raw.id || ""));
-      const dst = getTopicFilePath(dataDir, id);
-      if (fs4.existsSync(dst)) {
-        try {
-          const existingParsed = parseTopicMarkdown(fs4.readFileSync(dst, "utf8"), dst);
-          if (existingParsed.note && existingParsed.note.id === id && existingParsed.note.topic === topic && existingParsed.note.content === content) {
-            continue;
+      const remainingBudget = budget ? Math.max(1, budget.maxScanBytes - budget.bytesRead) : CHUNK_BYTES;
+      const toRead = Math.min(CHUNK_BYTES, size - pos, remainingBudget);
+      const n = fs4.readSync(fd, buf, 0, toRead, pos);
+      if (n <= 0) break;
+      pos += n;
+      if (budget) budget.bytesRead += n;
+      const slice = buf.subarray(0, n);
+      let segStart = 0;
+      for (let i = 0; i < n; i += 1) {
+        if (slice[i] === 10) {
+          let lineBuf;
+          const tailSlice = slice.subarray(segStart, i);
+          if (carryLen > 0) {
+            carryParts.push(tailSlice);
+            lineBuf = Buffer.concat(carryParts, carryLen + tailSlice.length);
+            carryParts = [];
+            carryLen = 0;
+          } else {
+            lineBuf = tailSlice;
           }
+          consumedBytes += lineBuf.length + 1;
+          segStart = i + 1;
+          const line = lineBuf.toString("utf8").trim();
+          if (line) onLine(line);
+        }
+      }
+      if (segStart < n) {
+        const rem = Buffer.from(slice.subarray(segStart));
+        carryParts.push(rem);
+        carryLen += rem.length;
+      }
+    }
+    if (carryLen > 0 && pos >= size) {
+      const trailing = Buffer.concat(carryParts, carryLen);
+      const trimmed = trailing.toString("utf8").trim();
+      if (trimmed) {
+        let validJson = false;
+        try {
+          JSON.parse(trimmed);
+          validJson = true;
         } catch {
+          validJson = false;
         }
-        allVerified = false;
-        warnings.push(`Migration collision for legacy note "${id}" (${dst} already exists with different content); preserved untouched.`);
-        continue;
-      }
-      const normalized = {
-        id,
-        topic,
-        content,
-        workspace: String(raw.workspace || "").trim(),
-        tags: normalizeTagsInput(raw.tags),
-        sessionId: String(raw.sessionId || "").trim(),
-        createdAt: Number(raw.createdAt) || Date.now(),
-        updatedAt: Number(raw.updatedAt) || Date.now()
-      };
-      writeTextAtomic(dst, serializeTopicMarkdown(normalized));
-      const verify = parseTopicMarkdown(fs4.readFileSync(dst, "utf8"), dst);
-      if (!verify.note || verify.note.id !== normalized.id || verify.note.topic !== normalized.topic || verify.note.content !== normalized.content) {
-        allVerified = false;
-        warnings.push(`Migration verification failed for note ${id}; legacy notes.json retained.`);
+        if (validJson) {
+          consumedBytes += carryLen;
+          onLine(trimmed);
+        }
       } else {
-        migratedAny = true;
+        consumedBytes += carryLen;
       }
     }
-    if (migratedAny || fs4.existsSync(topicsDir)) {
-      const freshWarnings = [];
-      const currentNotes = readTopicsFromDisk(dataDir, freshWarnings);
-      if (currentNotes.length > 0 && !fs4.existsSync(getMemoryIndexPath(dataDir))) {
-        rebuildMemoryIndexFile(dataDir, currentNotes);
-      }
-    }
-    if (allVerified) {
-      writeTextAtomic(markerPath, `migrated_at=${(/* @__PURE__ */ new Date()).toISOString()}
-count=${legacyNotes.length}
-`);
-    }
-  });
-}
-function loadNotesWithDiagnostics(dataDir = resolveDataDir(), opts = {}) {
-  const warnings = [];
-  const topicsDir = getTopicsDir(dataDir);
-  const memoryIndexPath = getMemoryIndexPath(dataDir);
-  if (opts.readOnly) {
-    const topicNotes = readTopicsFromDisk(dataDir, warnings);
-    if (topicNotes.length > 0 || fs4.existsSync(topicsDir)) {
-      return { notes: topicNotes, warnings, memoryIndexPath, topicsDir };
-    }
-    const legacy = loadLegacyJsonNotesReadOnly(dataDir);
-    return {
-      notes: legacy.notes,
-      warnings: [...warnings, ...legacy.warnings],
-      memoryIndexPath: getNotesPath(dataDir),
-      topicsDir
-    };
-  }
-  maybeMigrateLegacyNotesJson(dataDir, warnings);
-  const notes = readTopicsFromDisk(dataDir, warnings);
-  return { notes, warnings, memoryIndexPath, topicsDir };
-}
-function saveNoteResult(opts = {}) {
-  const {
-    dataDir = resolveDataDir(),
-    id = "",
-    deleteId = "",
-    topic = "",
-    content = "",
-    workspace,
-    tags,
-    sessionId = "",
-    expectedRevision = ""
-  } = opts;
-  const cleanExpectedRev = String(expectedRevision || "").trim();
-  try {
-    return withNotesLock(dataDir, () => {
-      const warnings = [];
-      maybeMigrateLegacyNotesJson(dataDir, warnings);
-      const notes = readTopicsFromDisk(dataDir, warnings);
-      const memoryIndexPath = getMemoryIndexPath(dataDir);
-      if (deleteId) {
-        const target = String(deleteId).trim();
-        if (!isValidNoteId(target)) {
-          return { text: `Error: Invalid deleteId "${target}".`, isError: true };
-        }
-        const existing2 = notes.find((n) => n.id === target);
-        if (!existing2 || !existing2.filePath || !fs4.existsSync(existing2.filePath)) {
-          return { text: `Error: Note "${target}" not found.`, isError: true };
-        }
-        const liveRaw = fs4.readFileSync(existing2.filePath, "utf8");
-        const liveRev = computeRevision(liveRaw);
-        if (cleanExpectedRev && cleanExpectedRev !== liveRev) {
-          return {
-            text: `Error: Revision conflict deleting note [${target}] (expected ${cleanExpectedRev}, live ${liveRev}). Live file preserved untouched.
-Path: ${existing2.filePath}
-Revision: ${liveRev}`,
-            isError: true
-          };
-        }
-        fs4.unlinkSync(existing2.filePath);
-        const freshAfter = readTopicsFromDisk(dataDir, []);
-        rebuildMemoryIndexFile(dataDir, freshAfter);
-        return {
-          text: `Deleted note ${target} (${existing2.filePath}). (${freshAfter.length} note(s) remaining)`,
-          isError: false
-        };
-      }
-      const cleanTopic = String(topic || "").trim();
-      const cleanContent = String(content || "").replace(/^\n+/, "").trimEnd();
-      if (!cleanTopic || !cleanContent.trim()) {
-        return {
-          text: "Error: both `topic` and `content` are required (or pass `deleteId` to remove a note).",
-          isError: true
-        };
-      }
-      const cleanId = String(id || "").trim();
-      if (cleanId && !isValidNoteId(cleanId)) {
-        return {
-          text: `Error: Invalid note id "${cleanId}". Use 1-64 ASCII letters, digits, '_' or '-' starting with a letter/digit.`,
-          isError: true
-        };
-      }
-      const hasWorkspaceArg = workspace !== void 0;
-      const hasTagsArg = tags !== void 0;
-      const cleanWsArg = hasWorkspaceArg ? String(workspace || "").trim() : "";
-      const cleanTagsArg = hasTagsArg ? normalizeTagsInput(tags) : [];
-      const now = Date.now();
-      const existing = cleanId ? notes.find((n) => n.id === cleanId) : notes.find(
-        (n) => n.topic.toLowerCase() === cleanTopic.toLowerCase() && n.workspace.toLowerCase() === cleanWsArg.toLowerCase()
-      );
-      if (cleanExpectedRev && !existing) {
-        return {
-          text: `Error: Revision conflict \u2014 note "${cleanId || cleanTopic}" does not exist on disk (expected revision ${cleanExpectedRev}). Refusing to recreate.`,
-          isError: true
-        };
-      }
-      const noteId = existing ? existing.id : cleanId || crypto.randomBytes(4).toString("hex");
-      const topicPath = existing?.filePath || getTopicFilePath(dataDir, noteId);
-      if (!existing && fs4.existsSync(topicPath)) {
-        return {
-          text: `Error: Destination file already exists for id "${noteId}" (${topicPath}). Refusing to overwrite an unreadable or untracked file.`,
-          isError: true
-        };
-      }
-      if (existing && fs4.existsSync(topicPath)) {
-        const liveRaw = fs4.readFileSync(topicPath, "utf8");
-        const liveRev = computeRevision(liveRaw);
-        if (cleanExpectedRev && cleanExpectedRev !== liveRev) {
-          return {
-            text: `Error: Revision conflict updating note [${noteId}] (expected ${cleanExpectedRev}, live ${liveRev}). Live file preserved untouched; re-read before retrying.
-Path: ${topicPath}
-Revision: ${liveRev}`,
-            isError: true
-          };
-        }
-      }
-      const saved = existing ? {
-        ...existing,
-        topic: cleanTopic,
-        content: cleanContent,
-        workspace: hasWorkspaceArg ? cleanWsArg : existing.workspace,
-        tags: hasTagsArg ? cleanTagsArg : existing.tags || [],
-        sessionId: sessionId || existing.sessionId || "",
-        updatedAt: now,
-        filePath: topicPath
-      } : {
-        id: noteId,
-        topic: cleanTopic,
-        content: cleanContent,
-        workspace: cleanWsArg,
-        tags: cleanTagsArg,
-        sessionId: String(sessionId || ""),
-        createdAt: now,
-        updatedAt: now,
-        filePath: topicPath
-      };
-      const md = serializeTopicMarkdown(saved);
-      saved.revision = computeRevision(md);
-      writeTextAtomic(topicPath, md);
-      const freshNotes = readTopicsFromDisk(dataDir, []);
-      rebuildMemoryIndexFile(dataDir, freshNotes);
-      const verb = existing ? "Updated" : "Saved";
-      const tagNote = saved.tags.length > 0 ? ` [${saved.tags.join(", ")}]` : "";
-      const wsNote = saved.workspace ? ` (${saved.workspace})` : "";
-      const warnNote = warnings.length > 0 ? `
-Warnings: ${warnings.join("; ")}` : "";
-      return {
-        text: `${verb} note [${saved.id}] "${saved.topic}"${tagNote}${wsNote}.
-Path: ${topicPath}
-Revision: ${saved.revision}
-Index: ${memoryIndexPath}${warnNote}`,
-        isError: false
-      };
-    });
+    return { newOffset: consumedBytes, eof: pos >= size, size, mtimeMs, ioError: false };
   } catch (err) {
-    return {
-      text: `Error saving note: ${err instanceof Error ? err.message : String(err)}`,
-      isError: true
-    };
+    if (budget) {
+      budget.incomplete = true;
+      budget.reason = `I/O read error (${err instanceof Error ? err.message : "read failed"})`;
+    }
+    return { newOffset: startOffset, eof: false, size: 0, mtimeMs: 0, ioError: true };
+  } finally {
+    if (fd !== null) {
+      try {
+        fs4.closeSync(fd);
+      } catch {
+      }
+    }
   }
 }
-function recallNotesResult(opts = {}) {
-  const {
-    dataDir = resolveDataDir(),
-    query = "",
-    workspace = "",
-    tag = "",
-    limit = 15,
-    maxChars = 8200
-  } = opts;
-  const { notes, warnings, memoryIndexPath } = loadNotesWithDiagnostics(dataDir);
-  const warnBlock = warnings.length > 0 ? `
-
-Warnings:
-${warnings.map((w) => `- ${w}`).join("\n")}` : "";
-  if (notes.length === 0) {
-    return { text: `No saved cross-session notes yet.${warnBlock}`, isError: false };
+function resolveToolPath(rawPath, primaryWorkspace) {
+  const cleaned = String(rawPath || "").trim().replace(/^["']|["']$/g, "");
+  if (!cleaned) return { rawPath: "", resolvedPath: "", basename: "" };
+  const isWin = /^[a-zA-Z]:[\\/]/.test(cleaned) || /^[a-zA-Z]:[\\/]/.test(primaryWorkspace);
+  const pathImpl = isWin ? path4.win32 : path4.posix;
+  let resolved = cleaned;
+  if (!pathImpl.isAbsolute(cleaned) && primaryWorkspace) {
+    resolved = pathImpl.resolve(primaryWorkspace, cleaned);
+  } else {
+    resolved = pathImpl.normalize(cleaned);
   }
-  const safeLimit = Math.max(1, Math.min(30, Number(limit) || 15));
-  const safeMaxChars = clampMaxChars(maxChars, 8200);
-  const terms = parseQueryTokens(query);
-  const tagFilter = String(tag || "").trim().toLowerCase();
-  const filtered = notes.filter((n) => {
-    if (workspace && !noteWorkspaceMatches(n.workspace, workspace)) return false;
-    if (tagFilter) {
-      const nTags = Array.isArray(n.tags) ? n.tags.map((t) => String(t).toLowerCase()) : [];
-      if (!nTags.includes(tagFilter)) return false;
-    }
-    if (terms.length > 0) {
-      const hay = `${n.id || ""} ${n.topic || ""} ${n.content || ""} ${(n.tags || []).join(" ")} ${n.workspace || ""}`.toLowerCase();
-      if (!terms.every((t) => hay.includes(t))) return false;
-    }
-    return true;
-  }).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, safeLimit);
-  if (filtered.length === 0) {
-    return {
-      text: `No saved notes matched your filter (${notes.length} total notes stored).${warnBlock}`,
-      isError: false
-    };
-  }
-  const now = Date.now();
-  const lines = [
-    `Saved cross-session notes (${filtered.length} of ${notes.length}; Index: ${memoryIndexPath}):`
-  ];
-  for (const n of filtered) {
-    const tagPart = Array.isArray(n.tags) && n.tags.length > 0 ? ` [${n.tags.join(", ")}]` : "";
-    const wsLabel = n.workspace ? formatWorkspaceLabel(n.workspace) : "";
-    const wsPart = wsLabel ? ` \xB7 ${wsLabel}` : "";
-    const srcPart = n.sessionId ? ` \xB7 from ${n.sessionId.slice(0, 8)}` : "";
-    lines.push(
-      `
-- **[${n.id}] ${n.topic}**${tagPart} (${formatShortDate(n.updatedAt)}, ${formatRelativeTime(n.updatedAt, now)}${wsPart}${srcPart})`
-    );
-    if (n.filePath) {
-      const lineCount = n.content.split("\n").length;
-      const revPart = n.revision ? ` \xB7 Revision: ${n.revision}` : "";
-      lines.push(`  Path: ${n.filePath} (${lineCount} lines${revPart})`);
-    }
-    const body = n.content.length > 1200 && n.filePath ? `${safeSliceChars(n.content, 1180)}\u2026 (use read_file on Path for full note)` : n.content;
-    lines.push(`  ${body}`);
-  }
-  if (warnBlock) lines.push(warnBlock);
-  return { text: truncateUtf8(lines.join("\n"), safeMaxChars), isError: false };
+  const normalized = resolved.replace(/\\/g, "/");
+  const basename = path4.posix.basename(normalized);
+  return { rawPath: cleaned, resolvedPath: normalized, basename };
 }
-
-// src/search.ts
-import { execFileSync as execFileSync2 } from "node:child_process";
-import fs6 from "node:fs";
 
 // src/trace.ts
 import fs5 from "node:fs";
 import path5 from "node:path";
 var MAX_TRACE_CACHE = 48;
 var IS_WIN = process.platform === "win32";
+var SINGLE_WRITE_TOOLS = /* @__PURE__ */ new Set([
+  "edit_file",
+  "write_file",
+  "replace_file_content",
+  "multi_replace_file_content",
+  "write_to_file"
+]);
+var SINGLE_READ_TOOLS = /* @__PURE__ */ new Set(["read_file", "view_file"]);
 var agyTraceCache = /* @__PURE__ */ new Map();
 function lruPutTrace(key, val) {
   if (agyTraceCache.has(key)) agyTraceCache.delete(key);
@@ -3082,7 +2679,7 @@ function lruPutTrace(key, val) {
     agyTraceCache.delete(first);
   }
 }
-function unwrapAgyArgValue(v) {
+function unwrapArgValue(v) {
   if (typeof v !== "string") return v;
   const trimmed = v.trim();
   if (trimmed.startsWith('"') && trimmed.endsWith('"') || trimmed.startsWith("[") && trimmed.endsWith("]") || trimmed.startsWith("{") && trimmed.endsWith("}")) {
@@ -3107,11 +2704,11 @@ function parseArgsRecord(raw) {
   }
   const out = {};
   for (const [k, v] of Object.entries(obj)) {
-    out[k] = unwrapAgyArgValue(v);
+    out[k] = unwrapArgValue(v);
   }
   return out;
 }
-function extractAgyPaths(toolName, args) {
+function extractFileToolPaths(toolName, args) {
   const low = toolName.toLowerCase();
   const out = [];
   const cwd = typeof args.cwd === "string" ? args.cwd.trim() : "";
@@ -3121,11 +2718,11 @@ function extractAgyPaths(toolName, args) {
     const joined = cwd && !path5.isAbsolute(val) && !/^[a-zA-Z]:[\\/]/.test(val) ? path5.posix.join(cwd.replace(/\\/g, "/"), val) : val;
     out.push({ path: joined, isWrite });
   };
-  if (low === "edit_file" || low === "write_file" || low === "replace_file_content" || low === "multi_replace_file_content" || low === "write_to_file") {
+  if (SINGLE_WRITE_TOOLS.has(low)) {
     pushPath(args.Path ?? args.TargetFile ?? args.path, true);
     return out;
   }
-  if (low === "mcp_agy-fast_fast_apply_edits" || low === "apply_edits") {
+  if (low === "apply_edits" || low.endsWith("_apply_edits")) {
     if (Array.isArray(args.edits)) {
       for (const e of args.edits) {
         if (e && typeof e === "object") pushPath(e.path, true);
@@ -3133,17 +2730,17 @@ function extractAgyPaths(toolName, args) {
     }
     return out;
   }
-  if (low === "read_file" || low === "view_file") {
+  if (SINGLE_READ_TOOLS.has(low)) {
     pushPath(args.Path ?? args.AbsolutePath ?? args.path, false);
     return out;
   }
-  if (low === "mcp_agy-fast_fast_quick_outline" || low === "quick_outline") {
+  if (low === "quick_outline" || low.endsWith("_quick_outline")) {
     if (Array.isArray(args.paths)) {
       for (const p of args.paths) pushPath(p, false);
     }
     return out;
   }
-  if (low === "mcp_agy-fast_fast_read_slices" || low === "read_slices") {
+  if (low === "read_slices" || low.endsWith("_read_slices")) {
     if (Array.isArray(args.outlines)) {
       for (const p of args.outlines) pushPath(p, false);
     }
@@ -3156,20 +2753,22 @@ function extractAgyPaths(toolName, args) {
   }
   return out;
 }
-function stripAgyTimestampHeader(text) {
+function stripTimestampHeader(text) {
   return text.replace(/^(?:(?:Created At|Completed At):\s*[^\n]+\n?)+/gi, "").replace(/\s+/g, " ").trim();
 }
 function isLikelyToolResponse(rawGeneric) {
   if (!rawGeneric.trim()) return false;
   if (/^(?:Created At|Completed At):/i.test(rawGeneric)) return true;
-  if (/^(?:Made \d+ replacement|Created file\.|Appended to file\.|Overwrote file\.|Showing lines |Command exited with code|The tool's output was truncated|Successfully |Encountered error in tool execution|Error:|Applied \d+ edit)/i.test(rawGeneric.trim())) {
+  if (/^(?:Made \d+ replacement|Created file\.|Appended to file\.|Overwrote file\.|Showing lines |Command exited with code|The tool's output was truncated|Successfully |Encountered error in tool execution|Error:|Applied \d+ edit)/i.test(
+    rawGeneric.trim()
+  )) {
     return true;
   }
   if (/^<(?:SYSTEM_MESSAGE|USER_REQUEST|CONTEXT_SUMMARY)/i.test(rawGeneric.trim())) return false;
   return true;
 }
-function parseAgyGenericOutcome(content) {
-  const cleaned = stripAgyTimestampHeader(content);
+function parseGenericOutcome(content) {
+  const cleaned = stripTimestampHeader(content);
   if (!cleaned) {
     return { status: "unverified", exitCode: null, snippet: "" };
   }
@@ -3217,9 +2816,6 @@ function pickMatchingPendingCall(batch, cleanedOutput) {
   return batch.shift();
 }
 function extractSessionTraceDoc(entry, budget) {
-  if (entry.source !== "agy") {
-    return { fileEvents: [], errorEvents: [], passEvents: [] };
-  }
   const filePath = entry.paths.transcriptPath;
   let st;
   try {
@@ -3257,11 +2853,11 @@ function extractSessionTraceDoc(entry, budget) {
   const flushNextWithOutcome = (resultStepIndex, genericContent) => {
     if (state.pendingBatch.length === 0) return;
     if (!isLikelyToolResponse(genericContent)) return;
-    const cleaned = stripAgyTimestampHeader(genericContent);
+    const cleaned = stripTimestampHeader(genericContent);
     const call = pickMatchingPendingCall(state.pendingBatch, cleaned);
     if (!call) return;
-    const outcome = parseAgyGenericOutcome(genericContent);
-    const pathHits = extractAgyPaths(call.name, call.args);
+    const outcome = parseGenericOutcome(genericContent);
+    const pathHits = extractFileToolPaths(call.name, call.args);
     for (const ph of pathHits) {
       const norm = resolveToolPath(ph.path, primaryWs);
       if (!norm.resolvedPath) continue;
@@ -3281,9 +2877,10 @@ function extractSessionTraceDoc(entry, budget) {
     }
     const cmdLine = String(call.args.CommandLine || call.args.command || "").trim();
     const cmdCwd = String(call.args.Cwd || call.args.cwd || primaryWs || "").trim();
-    const isCmd = call.name === "run_command" || call.name === "mcp_agy-fast_fast_run_checks";
+    const lowName = call.name.toLowerCase();
+    const isCmd = lowName === "run_command" || lowName.endsWith("_run_checks");
     const invocation = cmdLine ? cmdLine.split(/\r?\n/)[0].slice(0, 160) : pathHits[0] ? `${call.name} ${pathHits[0].path}` : call.name;
-    const cmdKey = cmdLine ? buildFullCommandKey(cmdLine, cmdCwd) : `${call.name.toLowerCase()}:${pathHits[0]?.path || ""}`;
+    const cmdKey = cmdLine ? buildFullCommandKey(cmdLine, cmdCwd) : `${lowName}:${pathHits[0]?.path || ""}`;
     if (outcome.status === "failed") {
       state.doc.errorEvents.push({
         stepIndex: call.stepIndex,
@@ -3380,18 +2977,10 @@ function matchesTargetFile(ev, queryNorm, isBasenameQuery) {
   return resNorm === queryNorm || resNorm.endsWith(`/${queryNorm}`);
 }
 function runFileHistorySearch(opts) {
-  const { eligible, query, sourceCoverage, maxSessions, maxChars } = opts;
+  const { eligible, query, coverageLabel, maxSessions, maxChars } = opts;
   const cleanQuery = String(query || "").trim().replace(/\\/g, "/").replace(/^["']|["']$/g, "");
   if (!cleanQuery) {
     return { text: "Error: query (file path or filename) is required for mode='file_history'.", isError: true };
-  }
-  const agyEligible = eligible.filter((e) => e.source === "agy");
-  const skippedExt = eligible.length - agyEligible.length;
-  if (agyEligible.length === 0 && skippedExt > 0) {
-    return {
-      text: `Trace mode "file_history" currently supports Antigravity (agy) sessions only so every cited #step round-trips through read_session(mode="turns"). Use mode="text" for Codex/Claude sessions.`,
-      isError: true
-    };
   }
   const queryNorm = normalizeForMatch(cleanQuery);
   const isBasenameQuery = !queryNorm.includes("/");
@@ -3399,7 +2988,7 @@ function runFileHistorySearch(opts) {
   const now = Date.now();
   const hits = [];
   const distinctPaths = /* @__PURE__ */ new Map();
-  for (const entry of agyEligible) {
+  for (const entry of eligible) {
     if (!checkScanBudget(budget)) break;
     budget.sessionsScanned += 1;
     const doc = extractSessionTraceDoc(entry, budget);
@@ -3429,8 +3018,7 @@ function runFileHistorySearch(opts) {
     }
     hits.push({ entry, writes, failedWrites, unverifiedWrites, reads, resolvedPaths });
   }
-  const scopeNote = skippedExt > 0 ? `${sourceCoverage}; agy-only for trace` : sourceCoverage;
-  const coverageBanner = budget.incomplete ? `INCOMPLETE SCAN (${budget.sessionsScanned}/${agyEligible.length} agy sessions, ${(budget.bytesRead / (1024 * 1024)).toFixed(1)} MB; ${budget.reason}; narrow with workspace/sinceDays \u2014 do NOT treat 0-match as authoritative).` : `Complete scan: ${budget.sessionsScanned}/${agyEligible.length} agy sessions (${scopeNote}).`;
+  const coverageBanner = budget.incomplete ? `INCOMPLETE SCAN (${budget.sessionsScanned}/${eligible.length} sessions, ${(budget.bytesRead / (1024 * 1024)).toFixed(1)} MB; ${budget.reason}; narrow with workspace/sinceDays \u2014 do NOT treat 0-match as authoritative).` : `Complete scan: ${budget.sessionsScanned}/${eligible.length} sessions (${coverageLabel}).`;
   if (hits.length === 0) {
     return {
       text: `No file tool history matched "${cleanQuery}".
@@ -3476,7 +3064,9 @@ Disambiguation: "${cleanQuery}" matched ${distinctPaths.size} distinct resolved 
     const exemplar = h.writes[h.writes.length - 1] || h.unverifiedWrites[0] || h.failedWrites[0] || h.reads[0];
     const steps = [...new Set([...h.writes, ...h.unverifiedWrites, ...h.failedWrites].map((x) => `#${x.stepIndex}`))].slice(-6);
     if (steps.length > 0) {
-      lines.push(`Write steps: ${steps.join(", ")} (use read_session(sessionId="${e.shortId}", mode="turns", startStep, endStep) for verbatim context)`);
+      lines.push(
+        `Write steps: ${steps.join(", ")} (use read_session(sessionId="${e.shortId}", mode="turns", startStep, endStep) for verbatim context)`
+      );
     } else {
       const rSteps = [...new Set(h.reads.map((x) => `#${x.stepIndex}`))].slice(-4);
       lines.push(`Read steps: ${rSteps.join(", ")}`);
@@ -3491,23 +3081,15 @@ Disambiguation: "${cleanQuery}" matched ${distinctPaths.size} distinct resolved 
   return { text: truncateUtf8(lines.join("\n"), maxChars), isError: false };
 }
 function runErrorHistorySearch(opts) {
-  const { eligible, query, sourceCoverage, maxSessions, maxChars } = opts;
+  const { eligible, query, coverageLabel, maxSessions, maxChars } = opts;
   const terms = parseQueryTokens(query);
   if (terms.length === 0) {
     return { text: "Error: query (error pattern or command keyword) is required for mode='error_history'.", isError: true };
   }
-  const agyEligible = eligible.filter((e) => e.source === "agy");
-  const skippedExt = eligible.length - agyEligible.length;
-  if (agyEligible.length === 0 && skippedExt > 0) {
-    return {
-      text: `Trace mode "error_history" currently supports Antigravity (agy) sessions only so every cited #step round-trips through read_session(mode="turns"). Use mode="text" for Codex/Claude sessions.`,
-      isError: true
-    };
-  }
   const budget = createScanBudget(opts.maxScanBytes, opts.maxScanMs);
   const now = Date.now();
   const hits = [];
-  for (const entry of agyEligible) {
+  for (const entry of eligible) {
     if (!checkScanBudget(budget)) break;
     budget.sessionsScanned += 1;
     const doc = extractSessionTraceDoc(entry, budget);
@@ -3524,8 +3106,7 @@ function runErrorHistorySearch(opts) {
       hits.push({ entry, items: matchedItems.slice(-3) });
     }
   }
-  const scopeNote = skippedExt > 0 ? `${sourceCoverage}; agy-only for trace` : sourceCoverage;
-  const coverageBanner = budget.incomplete ? `INCOMPLETE SCAN (${budget.sessionsScanned}/${agyEligible.length} agy sessions, ${(budget.bytesRead / (1024 * 1024)).toFixed(1)} MB; ${budget.reason}; narrow with workspace/sinceDays \u2014 do NOT treat 0-match as authoritative).` : `Complete scan: ${budget.sessionsScanned}/${agyEligible.length} agy sessions (${scopeNote}).`;
+  const coverageBanner = budget.incomplete ? `INCOMPLETE SCAN (${budget.sessionsScanned}/${eligible.length} sessions, ${(budget.bytesRead / (1024 * 1024)).toFixed(1)} MB; ${budget.reason}; narrow with workspace/sinceDays \u2014 do NOT treat 0-match as authoritative).` : `Complete scan: ${budget.sessionsScanned}/${eligible.length} sessions (${coverageLabel}).`;
   if (hits.length === 0) {
     return {
       text: `No failed tool/command history matched "${query}".
@@ -3575,7 +3156,7 @@ var JSON_ESCAPED_CHAR_RE = /["\\<>&\n\r\t]/;
 var CJK_CHAR_RE = /[\u3400-\u9fff\uf900-\ufaff]/g;
 function parseSearchQuery(rawQuery, isRegex) {
   const text = String(rawQuery || "").trim();
-  if (!text) return { terms: [], regex: null, error: "Error: query is required." };
+  if (!text) return { terms: [], regex: null, error: null };
   if (isRegex) {
     try {
       return { terms: [text], regex: new RegExp(text, "i"), error: null };
@@ -3589,9 +3170,6 @@ function parseSearchQuery(rawQuery, isRegex) {
     }
   }
   const terms = parseQueryTokens(text);
-  if (terms.length === 0) {
-    return { terms: [], regex: null, error: "Error: query is required." };
-  }
   return { terms, regex: null, error: null };
 }
 function buildCenteredSnippet(text, terms, regex, radius = 95) {
@@ -3655,7 +3233,7 @@ function collectEligibleRgFiles(entries, scope) {
         registerFile(entry.paths.transcriptFullPath, entry.canonicalId);
       }
     }
-    if (wantArtifacts && entry.source === "agy") {
+    if (wantArtifacts) {
       const arts = listSessionArtifactFiles(entry.paths.brainDir, { includeMeta: false });
       for (const art of arts) {
         registerFile(art.path, entry.canonicalId);
@@ -3680,7 +3258,7 @@ function findMatchingSessionsWithRg(entries, pattern, isRegex, scope) {
     let chunkDone = false;
     for (const rgBin of RG_CANDIDATES) {
       try {
-        const stdout = execFileSync2(rgBin, args, {
+        const stdout = execFileSync3(rgBin, args, {
           encoding: "utf8",
           timeout: 4e3,
           maxBuffer: 4 * 1024 * 1024,
@@ -3746,13 +3324,9 @@ function selectDiverseSnippets(candidates, terms, maxSnippets) {
         const nearExisting = selected.some(
           (picked) => picked.role === cand.role && picked.stepIndex >= 0 && cand.stepIndex >= 0 && Math.abs(picked.stepIndex - cand.stepIndex) <= 12
         );
-        if (nearExisting) {
-          effective -= 2;
-        }
+        if (nearExisting) effective -= 2;
         const distinctSource = selected.every((picked) => picked.sourceKind !== cand.sourceKind);
-        if (distinctSource) {
-          effective += 1.2;
-        }
+        if (distinctSource) effective += 1.2;
       }
       if (effective > bestEffective || effective === bestEffective && cand.stepIndex > remaining[bestIdx].stepIndex) {
         bestEffective = effective;
@@ -3878,14 +3452,52 @@ ${art.content}`, terms, regex);
     skippedInFlight
   };
 }
+function formatListedSessions(eligible, opts) {
+  const shown = eligible.slice(0, opts.maxSessions);
+  const scopeNote = opts.scopeFilter ? `scope=${formatScopeKey(opts.scopeFilter)}` : `clients=${opts.coverageLabel}`;
+  const wsNote = opts.workspace ? `, workspace~"${opts.workspace}"` : "";
+  if (shown.length === 0) {
+    return {
+      text: `No matching conversations found (${scopeNote}${wsNote}).`,
+      isError: false
+    };
+  }
+  const lines = [`Recent conversations (${shown.length} of ${eligible.length} shown; ${scopeNote}${wsNote}):`, ""];
+  for (const s of shown) {
+    const artifacts = listSessionArtifactFiles(s.paths.brainDir, { includeMeta: false });
+    const wsName = s.workspaces[0] ? formatWorkspaceLabel(s.workspaces[0]) : "";
+    const badges = [];
+    if (s.notFullyIdle) badges.push("active");
+    if (s.hasSwarm) badges.push("swarm");
+    if (artifacts.length > 0) badges.push(`${artifacts.length} artifacts`);
+    if (s.isChild) badges.push("child");
+    const badgeStr = badges.length > 0 ? ` [${badges.join(", ")}]` : "";
+    const title = s.title || "(untitled)";
+    const meta = [
+      formatShortDate(s.updatedMs),
+      formatRelativeTime(s.updatedMs, opts.now),
+      s.client,
+      wsName,
+      s.stepCount > 0 ? `${s.stepCount} steps` : ""
+    ].filter(Boolean).join(" \xB7 ");
+    lines.push(`- **${s.shortId}** (${s.sessionId}) \u2014 ${title}${badgeStr}`);
+    lines.push(`  ${meta}`);
+    if (s.preview && s.preview !== s.title) {
+      lines.push(`  Preview: ${safeSliceChars(s.preview.replace(/\s+/g, " ").trim(), 140)}`);
+    }
+  }
+  return { text: truncateUtf8(lines.join("\n"), opts.maxChars), isError: false };
+}
 function searchSessionsResult(opts = {}) {
   const {
-    dataDir = resolveDataDir(),
+    dataDir = "",
     query = "",
     mode = "text",
-    source = "agy",
     scope = "all",
     regex: isRegex = false,
+    conversationId = "",
+    scopeKey: explicitScopeStr = "",
+    allScopes = false,
     workspace = "",
     sessionId = "",
     includeChildren = false,
@@ -3904,32 +3516,60 @@ function searchSessionsResult(opts = {}) {
       isError: true
     };
   }
-  const parsedSource = parseSourceFilter(source);
-  if (parsedSource.error) {
-    return { text: parsedSource.error, isError: true };
-  }
   const targetSessionRef = String(sessionId || "").trim();
-  const explicitTargetSrc = targetSessionRef ? splitCanonicalRef(targetSessionRef).source : null;
-  const effectiveSource = explicitTargetSrc || parsedSource.source;
   const safeMaxSessions = Math.max(1, Math.min(25, Number(maxSessions) || 10));
   const safeMaxSnippets = Math.max(1, Math.min(8, Number(maxSnippetsPerSession) || 3));
   const safeMaxChars = clampMaxChars(maxChars, 8200);
-  const { entries: catalog, coverageLabel } = loadFederatedCatalog(dataDir, effectiveSource);
+  const { entries: catalog, coverageLabel } = loadMultiClientCatalog(dataDir);
   const now = Date.now();
   const minMs = sinceDays > 0 ? now - sinceDays * 24 * 3600 * 1e3 : 0;
+  let activeScopeFilter = null;
+  let effectiveExclude = excludeSessionId;
+  if (!allScopes) {
+    if (explicitScopeStr.trim()) {
+      const parsed2 = parseExplicitScopeKey(explicitScopeStr);
+      if (!parsed2 || parsed2.kind === "global") {
+        return { text: `Error: Invalid scopeKey "${explicitScopeStr}".`, isError: true };
+      }
+      activeScopeFilter = parsed2;
+    } else if (conversationId.trim()) {
+      const ctx = resolveConversationContext({
+        conversationId: conversationId.trim(),
+        overrideDataDir: dataDir,
+        catalog
+      });
+      if (ctx.scopeKey.kind === "unresolved") {
+        return {
+          text: `Error: Could not resolve project scope for conversation "${conversationId}"${ctx.diagnostic ? ` (${ctx.diagnostic})` : ""}. Pass allScopes=true or workspace to search without project scoping.`,
+          isError: true
+        };
+      }
+      activeScopeFilter = ctx.scopeKey;
+      if (!targetSessionRef) {
+        effectiveExclude = effectiveExclude ? `${effectiveExclude},${conversationId.trim()}` : conversationId.trim();
+      }
+    } else if (!targetSessionRef && !workspace.trim()) {
+      return {
+        text: "Error: Pass conversationId (from [agy-memory] startup header) to stay scoped to your project, or set allScopes=true to search across all projects.",
+        isError: true
+      };
+    }
+  }
   let eligible;
   if (targetSessionRef) {
-    const resolved = resolveSessionEntry(dataDir, targetSessionRef, catalog, effectiveSource);
+    const resolved = resolveSessionEntry(dataDir, targetSessionRef, catalog);
     if (!resolved.entry) {
       return { text: `Error: ${resolved.error || `No conversation matched "${targetSessionRef}".`}`, isError: true };
     }
     const s = resolved.entry;
-    const excluded = excludeSessionId && matchesSessionId(s.sessionId, excludeSessionId, s.source) || minMs > 0 && s.updatedMs < minMs || !workspaceMatches(s.workspaces, workspace);
+    const scopeMismatch = activeScopeFilter !== null && !scopeKeysEqual(s.scopeKey, activeScopeFilter);
+    const excluded = scopeMismatch || effectiveExclude && matchesSessionId(s.sessionId, effectiveExclude, s.client) || minMs > 0 && s.updatedMs < minMs || !workspaceMatches(s.workspaces, workspace);
     eligible = excluded ? [] : [s];
   } else {
     eligible = catalog.filter((s) => {
       if (!includeChildren && s.isChild) return false;
-      if (excludeSessionId && matchesSessionId(s.sessionId, excludeSessionId, s.source)) return false;
+      if (activeScopeFilter && !scopeKeysEqual(s.scopeKey, activeScopeFilter)) return false;
+      if (effectiveExclude && matchesSessionId(s.sessionId, effectiveExclude, s.client)) return false;
       if (minMs > 0 && s.updatedMs < minMs) return false;
       if (!workspaceMatches(s.workspaces, workspace)) return false;
       return true;
@@ -3939,24 +3579,32 @@ function searchSessionsResult(opts = {}) {
     return runFileHistorySearch({
       eligible,
       query,
-      sourceCoverage: coverageLabel,
+      coverageLabel,
       maxSessions: safeMaxSessions,
       maxChars: safeMaxChars,
       maxScanBytes,
-      maxScanMs,
-      workspace
+      maxScanMs
     });
   }
   if (safeMode === "error_history") {
     return runErrorHistorySearch({
       eligible,
       query,
-      sourceCoverage: coverageLabel,
+      coverageLabel,
       maxSessions: safeMaxSessions,
       maxChars: safeMaxChars,
       maxScanBytes,
-      maxScanMs,
-      workspace
+      maxScanMs
+    });
+  }
+  if (!String(query || "").trim()) {
+    return formatListedSessions(eligible, {
+      coverageLabel,
+      scopeFilter: activeScopeFilter,
+      workspace,
+      maxSessions: safeMaxSessions,
+      maxChars: safeMaxChars,
+      now
     });
   }
   const safeScope = String(scope || "all").trim().toLowerCase();
@@ -3971,6 +3619,16 @@ function searchSessionsResult(opts = {}) {
     return { text: parsed.error, isError: true };
   }
   const { terms, regex } = parsed;
+  if (terms.length === 0) {
+    return formatListedSessions(eligible, {
+      coverageLabel,
+      scopeFilter: activeScopeFilter,
+      workspace,
+      maxSessions: safeMaxSessions,
+      maxChars: safeMaxChars,
+      now
+    });
+  }
   const budget = createScanBudget(maxScanBytes, maxScanMs);
   const hasJsonSpecial = terms.some((t) => JSON_ESCAPED_CHAR_RE.test(t));
   const uncachedEntries = eligible.filter((s) => !isSessionDocCached(s));
@@ -3993,7 +3651,7 @@ function searchSessionsResult(opts = {}) {
           const lowTitle = `${s.title} ${s.preview}`.trim().toLowerCase();
           if (lowTitle.includes(seedTerm)) return true;
         }
-        if (checkArtifactNames && s.source === "agy") {
+        if (checkArtifactNames) {
           const arts = listSessionArtifactFiles(s.paths.brainDir, { includeMeta: false });
           if (arts.some((a) => a.name.toLowerCase().includes(seedTerm))) return true;
         }
@@ -4027,9 +3685,11 @@ function searchSessionsResult(opts = {}) {
   results.sort((a, b) => b.score - a.score || b.entry.updatedMs - a.entry.updatedMs);
   const top = results.slice(0, safeMaxSessions);
   const incompleteNote = budget.incomplete ? `INCOMPLETE SCAN (${budget.sessionsScanned}/${toScan.length} candidates, ${(budget.bytesRead / (1024 * 1024)).toFixed(1)} MB; ${budget.reason}; narrow with workspace/sinceDays \u2014 do NOT treat 0-match as authoritative).` : "";
+  const scopeDesc = activeScopeFilter ? `projectScope=${formatScopeKey(activeScopeFilter)}` : `clients=${coverageLabel}`;
   if (top.length === 0) {
     const scopeLabel = safeScope === "all" ? "transcripts, artifacts, and swarm boards" : safeScope;
     const filters = [];
+    if (activeScopeFilter) filters.push(`projectScope=${formatScopeKey(activeScopeFilter)}`);
     if (workspace) filters.push(`workspace~"${workspace}"`);
     if (targetSessionRef) filters.push(`sessionId="${targetSessionRef}"`);
     if (skippedInFlightCount > 0) filters.push("excluded active in-flight prompt");
@@ -4039,23 +3699,22 @@ ${incompleteNote}` : `
 Complete scan (${eligible.length} eligible session(s), ${coverageLabel}).
 Note: text mode searches user/assistant replies, artifacts, and Swarm only; for failed commands/exit codes or tool file edits, try mode="error_history" or mode="file_history".`;
     return {
-      text: `No past conversations matched "${query}" (searched ${eligible.length} session(s) [${coverageLabel}] across ${scopeLabel}${filterSuffix}).${statusLine}`,
+      text: `No past conversations matched "${query}" (searched ${eligible.length} session(s) [${scopeDesc}] across ${scopeLabel}${filterSuffix}).${statusLine}`,
       isError: false
     };
   }
   const lines = [
-    `Search "${query}" \u2014 ${results.length} matching conversation(s) (showing top ${top.length}, scope=${safeScope}, sources=${coverageLabel}${targetSessionRef ? `, session=${targetSessionRef}` : ""}):`
+    `Search "${query}" \u2014 ${results.length} matching conversation(s) (showing top ${top.length}, scope=${safeScope}, ${scopeDesc}${targetSessionRef ? `, session=${targetSessionRef}` : ""}):`
   ];
   if (incompleteNote) lines.push(incompleteNote);
   for (const r of top) {
     const e = r.entry;
-    const wsName = e.workspaces.length > 0 ? formatWorkspaceLabel(e.workspaces[0] ?? "") : "";
-    const dispId = e.source === "agy" ? e.shortId : `${e.source}:${e.shortId}`;
+    const wsName = e.workspaces[0] ? formatWorkspaceLabel(e.workspaces[0]) : "";
     lines.push(
       `
-### ${dispId} \u2014 ${e.title || "(untitled)"} (${formatShortDate(e.updatedMs)}, ${formatRelativeTime(e.updatedMs, now)}${wsName ? `, ${wsName}` : ""})`
+### ${e.shortId} \u2014 ${e.title || "(untitled)"} (${formatShortDate(e.updatedMs)}, ${formatRelativeTime(e.updatedMs, now)}${wsName ? `, ${wsName}` : ""})`
     );
-    lines.push(`ID: ${e.source === "agy" ? e.sessionId : e.canonicalId}`);
+    lines.push(`ID: ${e.sessionId}`);
     if (r.snippets.length === 0 && r.titleMatched) {
       lines.push(`- [title] ${e.title || e.preview}`);
     } else {
@@ -4071,8 +3730,7 @@ Note: text mode searches user/assistant replies, artifacts, and Swarm only; for 
 }
 
 // src/tools.ts
-var SOURCE_ENUM = ["agy", "codex", "claude", "all"];
-var READ_ONLY_LOCAL_ANNOTATIONS = {
+var READ_ONLY_LOCAL = {
   readOnlyHint: true,
   destructiveHint: false,
   idempotentHint: true,
@@ -4080,264 +3738,26 @@ var READ_ONLY_LOCAL_ANNOTATIONS = {
 };
 var TOOL_DEFINITIONS = [
   {
-    name: "list_sessions",
-    description: "List recent local conversations newest first, returning session IDs, titles, workspaces, timestamps, step counts, and latest prompts. Use to discover session IDs without a search query; use search_sessions to search transcript content, file edits, or command errors, and read_session once you have an ID. Read-only and local-only; active filters combine with AND logic, child sessions are excluded by default, and output truncates at maxChars (default 8200).",
-    annotations: {
-      title: "List Past Sessions",
-      ...READ_ONLY_LOCAL_ANNOTATIONS
-    },
+    name: "board_read",
+    description: "Read active Project Blackboard entries (decisions, conventions, handoffs) with revisions, source sessions, and paths. Local read-only.",
+    annotations: { title: "Read Project Blackboard", ...READ_ONLY_LOCAL },
     inputSchema: {
       type: "object",
       properties: {
-        source: {
-          type: "string",
-          enum: SOURCE_ENUM,
-          default: "agy",
-          description: "CLI source: 'agy' (default), 'codex', 'claude', or 'all'."
-        },
-        workspace: {
-          type: "string",
-          description: "Case-insensitive workspace path substring filter."
-        },
-        query: {
-          type: "string",
-          description: "AND-matched keywords (quoted phrases supported) across title, ID, workspace, preview, and latest prompt."
-        },
-        includeChildren: {
-          type: "boolean",
-          default: false,
-          description: "Include subagent and Swarm worker child sessions (default false)."
-        },
-        excludeSessionId: {
-          type: "string",
-          description: "Comma-separated session IDs, prefixes, or qualified IDs (e.g. 'agy:<id>') to omit."
-        },
-        sinceHours: {
-          type: "number",
-          minimum: 0,
-          description: "Only sessions updated within the last N hours (0 disables)."
-        },
-        minSteps: {
-          type: "integer",
-          minimum: 0,
-          default: 0,
-          description: "Minimum step count (e.g. 5 to skip trivial sessions; default 0)."
-        },
-        limit: {
-          type: "integer",
-          minimum: 1,
-          maximum: 50,
-          default: 15,
-          description: "Max rows to return (1..50, default 15)."
-        },
-        maxChars: {
-          type: "integer",
-          minimum: 200,
-          maximum: 8200,
-          default: 8200,
-          description: "Output char cap before truncation (200..8200, default 8200)."
-        }
+        conversationId: { type: "string", description: "Current session UUID from [agy-memory] header." },
+        scope: { type: "string", default: "all", description: "'all' (project+global), 'project', 'global', or explicit scope key." },
+        keys: { type: "array", items: { type: "string" }, description: "Optional entry keys to fetch." },
+        query: { type: "string", description: "Optional AND filter." },
+        offset: { type: "integer", minimum: 0, description: "Entry paging offset." },
+        maxChars: { type: "integer", minimum: 200, maximum: 8200, description: "Char cap (default 8200)." }
       }
     }
   },
   {
-    name: "search_sessions",
-    description: "Search past local conversations by text, file edit/read history, or command failure history, returning grouped session IDs with #step citations and excerpts. Use list_sessions to browse without a query, read_session to inspect a known session, and recall_notes for saved notes. Choose mode='text' (default) to search replies, artifacts, and Swarm boards across agy/codex/claude (optional scope and regex); mode='file_history' for verified agy file writes vs reads; or mode='error_history' for failed commands, test failures, and non-zero exit codes (always use error_history for failures, even when querying a filename). Read-only and local-only; output caps at maxChars (default 8200) and emits INCOMPLETE SCAN if scan limits are hit (narrow via workspace, sinceDays, or sessionId).",
+    name: "board_post",
+    description: "Create, replace, or delete one keyed Project Blackboard entry (entries/<key>.md). Updates and deletes require expectedRevision.",
     annotations: {
-      title: "Search Past Sessions",
-      ...READ_ONLY_LOCAL_ANNOTATIONS
-    },
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          minLength: 1,
-          description: "AND keywords (quoted phrases supported), regex (when regex=true), file path/basename (file_history), or command/error/filename text (error_history)."
-        },
-        mode: {
-          type: "string",
-          enum: ["text", "file_history", "error_history"],
-          default: "text",
-          description: "'text' (default: replies/artifacts/Swarm), 'file_history' (verified agy file writes vs reads), or 'error_history' (failed commands/tests/exit codes in agy \u2014 use even when querying a filename)."
-        },
-        source: {
-          type: "string",
-          enum: SOURCE_ENUM,
-          default: "agy",
-          description: "CLI source for text mode (default 'agy'; overridden by qualified sessionId like 'codex:<id>')."
-        },
-        scope: {
-          type: "string",
-          enum: ["all", "user", "assistant", "artifacts", "swarm"],
-          default: "all",
-          description: "Sub-scope for mode='text' only (default 'all')."
-        },
-        regex: {
-          type: "boolean",
-          default: false,
-          description: "Treat query as case-insensitive regex in mode='text' (default false)."
-        },
-        sessionId: {
-          type: "string",
-          description: "Restrict to one session by full ID, unique prefix (>=4 chars), or qualified ID ('codex:<id>')."
-        },
-        workspace: {
-          type: "string",
-          description: "Case-insensitive workspace path substring filter."
-        },
-        includeChildren: {
-          type: "boolean",
-          default: false,
-          description: "Include subagent and Swarm worker child sessions (default false)."
-        },
-        excludeSessionId: {
-          type: "string",
-          description: "Comma-separated session IDs, prefixes, or qualified IDs (e.g. 'agy:<id>') to omit."
-        },
-        sinceDays: {
-          type: "number",
-          minimum: 0,
-          description: "Only scan sessions updated within the last N days (0 disables)."
-        },
-        maxSessions: {
-          type: "integer",
-          minimum: 1,
-          maximum: 25,
-          default: 10,
-          description: "Max matching sessions (1..25, default 10)."
-        },
-        maxSnippetsPerSession: {
-          type: "integer",
-          minimum: 1,
-          maximum: 8,
-          default: 3,
-          description: "Max excerpts/events per session (1..8, default 3)."
-        },
-        maxChars: {
-          type: "integer",
-          minimum: 200,
-          maximum: 8200,
-          default: 8200,
-          description: "Output char cap before truncation (200..8200, default 8200)."
-        }
-      },
-      required: ["query"]
-    }
-  },
-  {
-    name: "read_session",
-    description: "Read detailed content from one known local session by full ID, unique prefix (>=4 chars), or qualified ID (e.g. 'codex:<id>'). Use after getting an ID from list_sessions or search_sessions; do not use to browse or search across sessions. Select one view via mode: 'digest' (default) gives a per-turn outline, artifact paths, and Swarm summary; 'turns' returns full hydrated turns by startStep/endStep or tailTurns (default 6), with optional tool counts or thinking; 'artifacts' lists session Markdown files with paths or reads artifactName by startLine/endLine; 'swarm' returns the Swarm roster and board messages by seq range, tailMessages, or query. Read-only and local-only; output truncates at maxChars (default 8200)\u2014in mode='turns', pass the next charOffset to page through turns larger than maxChars.",
-    annotations: {
-      title: "Read Past Session",
-      ...READ_ONLY_LOCAL_ANNOTATIONS
-    },
-    inputSchema: {
-      type: "object",
-      properties: {
-        sessionId: {
-          type: "string",
-          minLength: 1,
-          description: "Target session full UUID, unique prefix (>=4 chars), or qualified ID ('agy:<id>', 'codex:<id>', 'claude:<id>')."
-        },
-        source: {
-          type: "string",
-          enum: SOURCE_ENUM,
-          default: "agy",
-          description: "CLI source for resolving sessionId (default 'agy'; overridden by 'source:' prefix)."
-        },
-        mode: {
-          type: "string",
-          enum: ["digest", "turns", "artifacts", "swarm"],
-          default: "digest",
-          description: "View mode: 'digest' (default overview), 'turns', 'artifacts', or 'swarm'."
-        },
-        startStep: {
-          type: "integer",
-          minimum: 0,
-          description: "mode='turns': inclusive start step (overrides tailTurns)."
-        },
-        endStep: {
-          type: "integer",
-          minimum: 0,
-          description: "mode='turns': inclusive end step."
-        },
-        tailTurns: {
-          type: "integer",
-          minimum: 1,
-          maximum: 40,
-          default: 6,
-          description: "mode='turns': last N turns when step bounds are omitted (1..40, default 6)."
-        },
-        charOffset: {
-          type: "integer",
-          minimum: 0,
-          default: 0,
-          description: "mode='turns': character offset for paging turns exceeding maxChars (default 0)."
-        },
-        includeTools: {
-          type: "boolean",
-          default: false,
-          description: "mode='turns': include per-turn tool call counts (default false)."
-        },
-        includeThinking: {
-          type: "boolean",
-          default: false,
-          description: "mode='turns': include truncated thinking text (default false)."
-        },
-        artifactName: {
-          type: "string",
-          description: "mode='artifacts': filename to read (omit to list all artifacts and paths)."
-        },
-        startLine: {
-          type: "integer",
-          minimum: 1,
-          default: 1,
-          description: "mode='artifacts' with artifactName: 1-based start line (default 1)."
-        },
-        endLine: {
-          type: "integer",
-          minimum: 1,
-          default: 180,
-          description: "mode='artifacts' with artifactName: 1-based inclusive end line (default 180)."
-        },
-        tailMessages: {
-          type: "integer",
-          minimum: 1,
-          maximum: 100,
-          default: 20,
-          description: "mode='swarm': last N board messages when seq bounds are omitted (1..100, default 20)."
-        },
-        startSeq: {
-          type: "integer",
-          minimum: 1,
-          description: "mode='swarm': inclusive starting board #seq."
-        },
-        endSeq: {
-          type: "integer",
-          minimum: 1,
-          description: "mode='swarm': inclusive ending board #seq."
-        },
-        query: {
-          type: "string",
-          description: "mode='swarm': filter board messages by agent name or text."
-        },
-        maxChars: {
-          type: "integer",
-          minimum: 200,
-          maximum: 8200,
-          default: 8200,
-          description: "Output char cap before truncation (200..8200, default 8200)."
-        }
-      },
-      required: ["sessionId"]
-    }
-  },
-  {
-    name: "save_note",
-    description: "Create, update, or permanently delete a local cross-session Markdown note stored under topics/<id>.md and indexed in MEMORY.md. Use only to persist or remove durable decisions and preferences; use recall_notes for read-only lookups, and never store secrets or tokens. Mutates local files under a lock (deleteId is irreversible) with no network calls: pass topic and content to create or upsert by topic+workspace, add id to update in place (omitting workspace or tags preserves existing values), or pass deleteId alone to remove a note. Returns ID, file Path, and 12-char Revision; pass expectedRevision on updates/deletes to reject stale concurrent writes without overwriting.",
-    annotations: {
-      title: "Save, Update, or Delete Memory Note",
+      title: "Update Project Blackboard",
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: false,
@@ -4346,79 +3766,66 @@ var TOOL_DEFINITIONS = [
     inputSchema: {
       type: "object",
       properties: {
-        topic: {
-          type: "string",
-          description: "Short note title (required for create/update; ignored with deleteId)."
-        },
-        content: {
-          type: "string",
-          description: "Markdown note body (required for create/update; ignored with deleteId)."
-        },
-        workspace: {
-          type: "string",
-          description: "Optional workspace scope (omit on create for global; omit on id update to preserve)."
-        },
-        tags: {
-          type: "array",
-          items: { type: "string" },
-          description: "Optional recall tags (omit on id update to preserve)."
-        },
-        sessionId: {
-          type: "string",
-          description: "Optional source session ID recorded in frontmatter."
-        },
-        id: {
-          type: "string",
-          description: "Optional note ID (1..64 ASCII letters, digits, '_' or '-') to update in place or name on create."
-        },
-        expectedRevision: {
-          type: "string",
-          description: "12-char Revision hash from recall_notes/save_note; rejects stale updates/deletes without modifying disk."
-        },
-        deleteId: {
-          type: "string",
-          description: "Note ID to permanently delete (mutually exclusive with create/update; pair with expectedRevision)."
-        }
+        key: { type: "string", minLength: 1, description: "Lowercase slug key (1..64 of a-z, 0-9, '.', '_', '-')." },
+        body: { type: "string", description: "Markdown body (required unless delete=true)." },
+        title: { type: "string", description: "Optional short title." },
+        conversationId: { type: "string", description: "Current session UUID from [agy-memory] header." },
+        step: { type: "integer", minimum: 0, description: "Optional source step." },
+        scope: { type: "string", default: "project", description: "'project' (default), 'global', or explicit scope key." },
+        expectedRevision: { type: "string", description: "12-char revision hash for updates/deletes." },
+        delete: { type: "boolean", default: false, description: "Set true with expectedRevision to remove entry." }
+      },
+      required: ["key"]
+    }
+  },
+  {
+    name: "search_sessions",
+    description: "List or search local Antigravity sessions (App/CLI/IDE). Omit query to list. Modes: 'text' (replies/artifacts/Swarm), 'file_history' (writes vs reads), 'error_history' (failed commands/tests \u2014 use even with a filename). Pass conversationId to scope to current project or allScopes=true for all projects.",
+    annotations: { title: "List or Search Past Sessions", ...READ_ONLY_LOCAL },
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "AND keywords, regex, file path, or error text. Omit in text mode to list." },
+        mode: { type: "string", enum: ["text", "file_history", "error_history"], default: "text", description: "'text', 'file_history', or 'error_history'." },
+        scope: { type: "string", enum: ["all", "user", "assistant", "artifacts", "swarm"], default: "all", description: "Text sub-scope." },
+        regex: { type: "boolean", default: false, description: "Case-insensitive regex in text mode." },
+        conversationId: { type: "string", description: "Current session UUID (restricts to project scope and excludes self)." },
+        allScopes: { type: "boolean", default: false, description: "Search across all projects." },
+        sessionId: { type: "string", description: "Restrict to one session UUID or prefix (>=4 chars)." },
+        workspace: { type: "string", description: "Optional workspace path filter." },
+        includeChildren: { type: "boolean", default: false, description: "Include subagent/Swarm children." },
+        excludeSessionId: { type: "string", description: "Comma-separated IDs/prefixes to exclude." },
+        sinceDays: { type: "number", minimum: 0, description: "Only sessions within last N days." },
+        maxSessions: { type: "integer", minimum: 1, maximum: 25, description: "Max sessions (default 10)." },
+        maxChars: { type: "integer", minimum: 200, maximum: 8200, description: "Char cap (default 8200)." }
       }
     }
   },
   {
-    name: "recall_notes",
-    description: "Read and filter saved local cross-session Markdown notes, returning each note's ID, topic, preview, file Path, and Revision hash. Use before starting work or updating notes; use save_note to create, edit, or delete notes, and search_sessions for raw conversation logs. Read-only and local-only; query uses AND-matched keywords/phrases across all fields, workspace also retains global and parent-directory notes, and tag matches exactly (case-insensitive). Defaults to limit=15 and truncates at maxChars (default 8200); read long notes directly via the returned Path.",
-    annotations: {
-      title: "Recall Memory Notes",
-      ...READ_ONLY_LOCAL_ANNOTATIONS
-    },
+    name: "read_session",
+    description: "Read one local Antigravity session by UUID or prefix (>=4 chars): 'digest', 'turns' (hydrated, charOffset paging), 'artifacts', or 'swarm' (newest-first).",
+    annotations: { title: "Read Past Session", ...READ_ONLY_LOCAL },
     inputSchema: {
       type: "object",
       properties: {
-        query: {
-          type: "string",
-          description: "AND keywords (quoted phrases supported) across ID, topic, content, tags, and workspace."
-        },
-        workspace: {
-          type: "string",
-          description: "Workspace filter (also keeps global and parent-directory notes)."
-        },
-        tag: {
-          type: "string",
-          description: "Exact case-insensitive tag filter."
-        },
-        limit: {
-          type: "integer",
-          minimum: 1,
-          maximum: 30,
-          default: 15,
-          description: "Max notes to return (1..30, default 15)."
-        },
-        maxChars: {
-          type: "integer",
-          minimum: 200,
-          maximum: 8200,
-          default: 8200,
-          description: "Output char cap before truncation (200..8200, default 8200)."
-        }
-      }
+        sessionId: { type: "string", minLength: 1, description: "Session UUID or prefix (>=4 chars)." },
+        mode: { type: "string", enum: ["digest", "turns", "artifacts", "swarm"], default: "digest", description: "View mode." },
+        startStep: { type: "integer", minimum: 0, description: "turns: start step." },
+        endStep: { type: "integer", minimum: 0, description: "turns: end step." },
+        tailTurns: { type: "integer", minimum: 1, maximum: 40, description: "turns: last N turns." },
+        charOffset: { type: "integer", minimum: 0, description: "turns: paging offset." },
+        includeTools: { type: "boolean", default: false, description: "turns: tool counts." },
+        includeThinking: { type: "boolean", default: false, description: "turns: thinking excerpt." },
+        artifactName: { type: "string", description: "artifacts: filename (omit to list)." },
+        startLine: { type: "integer", minimum: 1, description: "artifacts: start line." },
+        endLine: { type: "integer", minimum: 1, description: "artifacts: end line." },
+        tailMessages: { type: "integer", minimum: 1, maximum: 100, description: "swarm: last N messages." },
+        startSeq: { type: "integer", minimum: 1, description: "swarm: start #seq." },
+        endSeq: { type: "integer", minimum: 1, description: "swarm: end #seq." },
+        query: { type: "string", description: "swarm: filter text/agent." },
+        maxChars: { type: "integer", minimum: 200, maximum: 8200, description: "Char cap (default 8200)." }
+      },
+      required: ["sessionId"]
     }
   }
 ];
@@ -4430,44 +3837,116 @@ function asOptionalNumber(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : void 0;
 }
+function resolveBoardToolScope(opts) {
+  const scopeStr = opts.rawScope.trim() || opts.defaultScope;
+  const cid = opts.conversationId.trim();
+  if (scopeStr === "global") {
+    const source = cid ? { client: "cli", conversationId: cid } : void 0;
+    return { scope: { kind: "global" }, includeGlobal: false, source };
+  }
+  const explicit = parseExplicitScopeKey(scopeStr);
+  if (explicit) {
+    let source;
+    if (cid) {
+      const ctx2 = resolveConversationContext({ conversationId: cid, overrideDataDir: opts.dataDir });
+      source = { client: ctx2.scopeKey.kind !== "unresolved" ? ctx2.client : "cli", conversationId: cid };
+    }
+    return { scope: explicit, includeGlobal: false, source };
+  }
+  if (scopeStr !== "project" && scopeStr !== "all") {
+    return {
+      scope: { kind: "unresolved" },
+      includeGlobal: false,
+      error: `Error: Invalid scope "${scopeStr}". Expected "project", "global", "all", or an explicit scope key.`
+    };
+  }
+  if (!cid) {
+    return {
+      scope: { kind: "unresolved" },
+      includeGlobal: false,
+      error: 'Error: Pass conversationId (from [agy-memory] startup header) or scope="global" so board access stays isolated to the right project.'
+    };
+  }
+  const ctx = resolveConversationContext({ conversationId: cid, overrideDataDir: opts.dataDir });
+  if (ctx.scopeKey.kind === "unresolved") {
+    return {
+      scope: ctx.scopeKey,
+      includeGlobal: false,
+      error: `Error: Could not resolve project scope for conversation "${cid}"${ctx.diagnostic ? ` (${ctx.diagnostic})` : ""}.`
+    };
+  }
+  return {
+    scope: ctx.scopeKey,
+    includeGlobal: scopeStr === "all",
+    source: { client: ctx.client, conversationId: cid }
+  };
+}
 function executeToolResult(name, rawArgs = {}, opts = {}) {
-  const dataDir = opts.dataDir ?? resolveDataDir();
+  const dataDir = opts.dataDir ?? "";
+  const boardsHome = opts.boardsHome ?? "";
   const args = rawArgs && typeof rawArgs === "object" ? rawArgs : {};
   switch (name) {
-    case "list_sessions":
-      return listSessionsResult({
+    case "board_read": {
+      const resolved = resolveBoardToolScope({
+        rawScope: asString(args.scope),
+        conversationId: asString(args.conversationId),
         dataDir,
-        source: asString(args.source) || "agy",
-        workspace: asString(args.workspace),
-        query: asString(args.query),
-        includeChildren: Boolean(args.includeChildren),
-        excludeSessionId: asString(args.excludeSessionId),
-        sinceHours: Number(args.sinceHours) || 0,
-        minSteps: Number(args.minSteps) || 0,
-        limit: asOptionalNumber(args.limit),
-        maxChars: asOptionalNumber(args.maxChars)
+        defaultScope: "all"
       });
+      if (resolved.error) return { text: resolved.error, isError: true };
+      const keys = Array.isArray(args.keys) ? args.keys.map(asString).filter(Boolean) : typeof args.keys === "string" && args.keys.trim() ? args.keys.split(",").map((s) => s.trim()).filter(Boolean) : void 0;
+      return boardReadResult({
+        scope: resolved.scope,
+        includeGlobal: resolved.includeGlobal,
+        keys,
+        query: asString(args.query),
+        offset: asOptionalNumber(args.offset),
+        maxChars: asOptionalNumber(args.maxChars),
+        boardsHome
+      });
+    }
+    case "board_post": {
+      const resolved = resolveBoardToolScope({
+        rawScope: asString(args.scope),
+        conversationId: asString(args.conversationId),
+        dataDir,
+        defaultScope: "project"
+      });
+      if (resolved.error) return { text: resolved.error, isError: true };
+      const step = asOptionalNumber(args.step);
+      const source = resolved.source ? { ...resolved.source, ...step !== void 0 && step >= 0 ? { step: Math.floor(step) } : {} } : void 0;
+      return boardPostResult({
+        scope: resolved.scope,
+        key: asString(args.key),
+        title: asString(args.title),
+        body: asString(args.body),
+        delete: Boolean(args.delete),
+        expectedRevision: asString(args.expectedRevision),
+        source,
+        boardsHome
+      });
+    }
     case "search_sessions":
       return searchSessionsResult({
         dataDir,
         query: asString(args.query),
         mode: asString(args.mode) || "text",
-        source: asString(args.source) || "agy",
         scope: asString(args.scope) || "all",
         regex: Boolean(args.regex),
+        conversationId: asString(args.conversationId),
+        scopeKey: asString(args.scopeKey),
+        allScopes: Boolean(args.allScopes),
         sessionId: asString(args.sessionId),
         workspace: asString(args.workspace),
         includeChildren: Boolean(args.includeChildren),
         excludeSessionId: asString(args.excludeSessionId),
         sinceDays: Number(args.sinceDays) || 0,
         maxSessions: asOptionalNumber(args.maxSessions),
-        maxSnippetsPerSession: asOptionalNumber(args.maxSnippetsPerSession),
         maxChars: asOptionalNumber(args.maxChars)
       });
     case "read_session":
       return readSessionResult({
         dataDir,
-        source: asString(args.source) || "agy",
         sessionId: asString(args.sessionId),
         mode: asString(args.mode) || "digest",
         startStep: typeof args.startStep === "number" ? args.startStep : null,
@@ -4485,30 +3964,6 @@ function executeToolResult(name, rawArgs = {}, opts = {}) {
         query: asString(args.query),
         maxChars: asOptionalNumber(args.maxChars)
       });
-    case "save_note": {
-      const hasWs = Object.prototype.hasOwnProperty.call(args, "workspace") && args.workspace !== void 0;
-      const hasTags = Object.prototype.hasOwnProperty.call(args, "tags") && args.tags !== void 0;
-      return saveNoteResult({
-        dataDir,
-        id: asString(args.id),
-        deleteId: asString(args.deleteId),
-        topic: asString(args.topic),
-        content: asString(args.content),
-        workspace: hasWs ? asString(args.workspace) : void 0,
-        tags: hasTags ? Array.isArray(args.tags) ? args.tags : typeof args.tags === "string" ? args.tags : [] : void 0,
-        sessionId: asString(args.sessionId),
-        expectedRevision: asString(args.expectedRevision)
-      });
-    }
-    case "recall_notes":
-      return recallNotesResult({
-        dataDir,
-        query: asString(args.query),
-        workspace: asString(args.workspace),
-        tag: asString(args.tag),
-        limit: asOptionalNumber(args.limit),
-        maxChars: asOptionalNumber(args.maxChars)
-      });
     default:
       return { text: `Error: Unknown tool: ${name}`, isError: true };
   }
@@ -4517,7 +3972,7 @@ function executeToolResult(name, rawArgs = {}, opts = {}) {
 // src/mcp-server.ts
 var SERVER_INFO = {
   name: "agy-memory",
-  version: "0.3.0"
+  version: "0.4.1"
 };
 var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
   "2024-11-05",
@@ -4568,7 +4023,7 @@ function handleJsonRpcMessage(msg) {
             tools: { listChanged: false }
           },
           serverInfo: SERVER_INFO,
-          instructions: "Local cross-conversation memory for Google Antigravity (agy), Codex, and Claude Code. Browse recent IDs with list_sessions, find matching sessions/edits/errors with search_sessions (use mode='error_history' for failed commands/tests), inspect one session with read_session (digest -> turns/artifacts/swarm), and manage durable Markdown notes with recall_notes and save_note (pass expectedRevision for CAS updates/deletes)."
+          instructions: "Project Blackboard and Verbatim Session Archive for Google Antigravity. Read/update active project decisions and handoffs with board_read and board_post (pass conversationId from [agy-memory] startup header; pass expectedRevision to update or delete). List or search past sessions/edits/errors with search_sessions (omit query to list; use mode='error_history' for failures) and inspect one session with read_session."
         }
       };
     }
@@ -4637,130 +4092,97 @@ function findHeaderSeparator(buf) {
 function runMcpStdioServer() {
   let rawBuf = Buffer.alloc(0);
   let framingMode = null;
-  const writeResponse = (obj) => {
-    if (!obj) return;
-    const body = JSON.stringify(obj);
+  const sendResponse = (resp) => {
+    if (!resp) return;
+    const payload = JSON.stringify(resp);
     if (framingMode === "lsp") {
-      const len = Buffer.byteLength(body, "utf8");
-      process.stdout.write(`Content-Length: ${len}\r
+      const byteLen = Buffer.byteLength(payload, "utf8");
+      process.stdout.write(`Content-Length: ${byteLen}\r
 \r
-${body}`);
+${payload}`);
     } else {
-      process.stdout.write(`${body}
+      process.stdout.write(`${payload}
 `);
     }
   };
-  const writeParseError = () => {
-    writeResponse({
-      jsonrpc: "2.0",
-      id: null,
-      error: {
-        code: -32700,
-        message: "Parse error"
-      }
-    });
-  };
-  const dispatchParsed = (parsed) => {
-    if (Array.isArray(parsed)) {
-      if (parsed.length === 0) {
-        writeResponse({
-          jsonrpc: "2.0",
-          id: null,
-          error: { code: -32600, message: "Invalid Request: empty batch" }
-        });
-        return;
-      }
-      const replies = parsed.map(handleJsonRpcMessage).filter((r) => r !== null);
-      if (replies.length > 0) writeResponse(replies);
+  const dispatchRawJson = (rawText) => {
+    const trimmed = rawText.trim();
+    if (!trimmed) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      sendResponse({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32700, message: "Parse error" }
+      });
       return;
     }
-    const reply = handleJsonRpcMessage(parsed);
-    if (reply) writeResponse(reply);
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) sendResponse(handleJsonRpcMessage(item));
+    } else {
+      sendResponse(handleJsonRpcMessage(parsed));
+    }
   };
-  const drainBuffer = (isEof = false) => {
+  const processBuffer = () => {
     while (rawBuf.length > 0) {
-      if (framingMode !== "lsp") {
-        let trimStart = 0;
-        while (trimStart < rawBuf.length && (rawBuf[trimStart] === 32 || rawBuf[trimStart] === 9 || rawBuf[trimStart] === 13 || rawBuf[trimStart] === 10)) {
-          trimStart += 1;
-        }
-        if (trimStart > 0) rawBuf = rawBuf.subarray(trimStart);
-        if (rawBuf.length === 0) return;
+      let lead = 0;
+      while (lead < rawBuf.length && (rawBuf[lead] === 13 || rawBuf[lead] === 10)) {
+        lead += 1;
       }
-      if (!framingMode) {
-        if (rawBuf[0] === 123 || rawBuf[0] === 91) {
-          framingMode = "jsonl";
-        } else {
-          const head = rawBuf.subarray(0, 64).toString("ascii");
-          if (/^(?:content-length|content-type|[a-z][a-z0-9-]*)\s*:/i.test(head)) {
-            framingMode = "lsp";
-          } else if (!isEof && rawBuf.length < 32 && rawBuf.indexOf(10) === -1) {
-            return;
-          } else {
-            framingMode = "jsonl";
-          }
-        }
-      }
-      if (framingMode === "lsp") {
-        let trimStart = 0;
-        while (trimStart < rawBuf.length && (rawBuf[trimStart] === 13 || rawBuf[trimStart] === 10)) {
-          trimStart += 1;
-        }
-        if (trimStart > 0) rawBuf = rawBuf.subarray(trimStart);
-        if (rawBuf.length === 0) return;
+      if (lead > 0) rawBuf = rawBuf.subarray(lead);
+      if (rawBuf.length === 0) return;
+      const firstByte = rawBuf[0];
+      const looksLikeJson = firstByte === 123 || firstByte === 91;
+      if (!looksLikeJson) {
         const sep = findHeaderSeparator(rawBuf);
         if (!sep) return;
-        const headerText = rawBuf.subarray(0, sep.idx).toString("ascii");
-        const m = /content-length:\s*(\d+)/i.exec(headerText);
-        if (!m || !m[1]) {
-          rawBuf = rawBuf.subarray(sep.idx + sep.sepLen);
-          writeParseError();
+        const headerBlock = rawBuf.subarray(0, sep.idx).toString("ascii");
+        const lenMatch = /content-length:\s*(\d+)/i.exec(headerBlock);
+        if (lenMatch) {
+          framingMode = "lsp";
+          const bodyLen = Number.parseInt(lenMatch[1], 10);
+          const bodyStart = sep.idx + sep.sepLen;
+          if (rawBuf.length < bodyStart + bodyLen) return;
+          const bodyStr = rawBuf.subarray(bodyStart, bodyStart + bodyLen).toString("utf8");
+          rawBuf = rawBuf.subarray(bodyStart + bodyLen);
+          dispatchRawJson(bodyStr);
           continue;
         }
-        const contentLen = Number(m[1]);
-        const bodyStart = sep.idx + sep.sepLen;
-        const totalNeeded = bodyStart + contentLen;
-        if (rawBuf.length < totalNeeded) return;
-        const jsonText = rawBuf.subarray(bodyStart, totalNeeded).toString("utf8");
-        rawBuf = rawBuf.subarray(totalNeeded);
-        try {
-          dispatchParsed(JSON.parse(jsonText));
-        } catch {
-          writeParseError();
-        }
-      } else {
-        const nlIdx = rawBuf.indexOf(10);
-        let lineBuf;
-        if (nlIdx === -1) {
-          if (!isEof) return;
-          lineBuf = rawBuf;
-          rawBuf = Buffer.alloc(0);
-        } else {
-          lineBuf = rawBuf.subarray(0, nlIdx);
-          rawBuf = rawBuf.subarray(nlIdx + 1);
-        }
-        const line = lineBuf.toString("utf8").trim();
-        if (!line) continue;
-        try {
-          dispatchParsed(JSON.parse(line));
-        } catch {
-          writeParseError();
-        }
       }
+      const nlIdx = rawBuf.indexOf(10);
+      if (nlIdx === -1) return;
+      if (!framingMode) framingMode = "jsonl";
+      const lineStr = rawBuf.subarray(0, nlIdx).toString("utf8");
+      rawBuf = rawBuf.subarray(nlIdx + 1);
+      dispatchRawJson(lineStr);
     }
   };
   process.stdin.on("data", (chunk) => {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
-    rawBuf = rawBuf.length === 0 ? buf : Buffer.concat([rawBuf, buf]);
-    drainBuffer(false);
+    const bufChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
+    rawBuf = Buffer.concat([rawBuf, bufChunk]);
+    processBuffer();
   });
   process.stdin.on("end", () => {
-    drainBuffer(true);
-    if (process.stdout.writable && !process.stdout.writableEnded) {
-      process.stdout.end();
+    if (rawBuf.length > 0) {
+      const rem = rawBuf.toString("utf8").trim();
+      if (rem && (rem.startsWith("{") || rem.startsWith("["))) {
+        if (!framingMode) framingMode = "jsonl";
+        dispatchRawJson(rem);
+      }
     }
   });
 }
+var BOOLEAN_CLI_FLAGS = /* @__PURE__ */ new Set([
+  "all-scopes",
+  "regex",
+  "include-children",
+  "include-tools",
+  "include-thinking",
+  "delete",
+  "dry-run"
+]);
 function parseCliArgs(argv) {
   const positional = [];
   const flags = {};
@@ -4773,7 +4195,7 @@ function parseCliArgs(argv) {
       } else {
         const key = tok.slice(2);
         const next = argv[i + 1];
-        if (next !== void 0 && !next.startsWith("--")) {
+        if (!BOOLEAN_CLI_FLAGS.has(key) && next !== void 0 && !next.startsWith("--")) {
           flags[key] = next;
           i += 1;
         } else {
@@ -4795,52 +4217,54 @@ function flagString(flags, key) {
   const v = flags[key];
   return typeof v === "string" ? v : "";
 }
+function parseBoolFlag(flags, key) {
+  const v = flags[key];
+  if (v === void 0 || v === false) return { value: false };
+  if (v === true) return { value: true };
+  const low = String(v).trim().toLowerCase();
+  if (low === "true" || low === "1") return { value: true };
+  if (low === "false" || low === "0") return { value: false };
+  return { value: false, error: `Error: Invalid boolean value "${v}" for --${key}. Use true or false.` };
+}
 function runCliMode(argv) {
   const { positional, flags } = parseCliArgs(argv);
   const sub = (positional[0] || "help").toLowerCase();
-  const dataDirFlag = flagString(flags, "data-dir");
-  const dataDirOpt = dataDirFlag ? { dataDir: dataDirFlag } : {};
-  if (sub === "list") {
-    const { text, isError } = executeToolResult(
-      "list_sessions",
-      {
-        source: flagString(flags, "source") || "agy",
-        workspace: flagString(flags, "workspace"),
-        query: positional.slice(1).join(" ") || flagString(flags, "query"),
-        includeChildren: Boolean(flags["include-children"]),
-        excludeSessionId: flagString(flags, "exclude"),
-        sinceHours: parseOptionalInt(flags["since-hours"]),
-        minSteps: parseOptionalInt(flags["min-steps"]),
-        limit: parseOptionalInt(flags.limit),
-        maxChars: parseOptionalInt(flags["max-chars"])
-      },
-      dataDirOpt
-    );
-    process.stdout.write(`${text}
+  const execOpts = {
+    ...flagString(flags, "data-dir") ? { dataDir: flagString(flags, "data-dir") } : {},
+    ...flagString(flags, "boards-home") ? { boardsHome: flagString(flags, "boards-home") } : {}
+  };
+  const failBool = (res) => {
+    if (!res.error) return false;
+    process.stderr.write(`${res.error}
 `);
-    if (isError) process.exitCode = 1;
-    return;
-  }
-  if (sub === "search") {
+    process.exitCode = 1;
+    return true;
+  };
+  if (sub === "list" || sub === "search") {
+    const regexFlag = parseBoolFlag(flags, "regex");
+    const allScopesFlag = parseBoolFlag(flags, "all-scopes");
+    const includeChildrenFlag = parseBoolFlag(flags, "include-children");
+    if (failBool(regexFlag) || failBool(allScopesFlag) || failBool(includeChildrenFlag)) return;
     const query = positional.slice(1).join(" ") || flagString(flags, "query");
     const { text, isError } = executeToolResult(
       "search_sessions",
       {
-        query,
+        query: sub === "list" && !query ? "" : query,
         mode: flagString(flags, "mode") || "text",
-        source: flagString(flags, "source") || "agy",
         scope: flagString(flags, "scope") || "all",
-        regex: Boolean(flags.regex),
+        regex: regexFlag.value,
+        conversationId: flagString(flags, "conversation"),
+        scopeKey: flagString(flags, "scope-key"),
+        allScopes: allScopesFlag.value,
         sessionId: flagString(flags, "session"),
         workspace: flagString(flags, "workspace"),
-        includeChildren: Boolean(flags["include-children"]),
+        includeChildren: includeChildrenFlag.value,
         excludeSessionId: flagString(flags, "exclude"),
         sinceDays: parseOptionalInt(flags["since-days"]),
         maxSessions: parseOptionalInt(flags.limit),
-        maxSnippetsPerSession: parseOptionalInt(flags["max-snippets"]),
         maxChars: parseOptionalInt(flags["max-chars"])
       },
-      dataDirOpt
+      execOpts
     );
     process.stdout.write(`${text}
 `);
@@ -4848,12 +4272,14 @@ function runCliMode(argv) {
     return;
   }
   if (sub === "read") {
+    const toolsFlag = parseBoolFlag(flags, "tools");
+    const thinkingFlag = parseBoolFlag(flags, "thinking");
+    if (failBool(toolsFlag) || failBool(thinkingFlag)) return;
     const sessionId = positional[1] || flagString(flags, "session");
     const { text, isError } = executeToolResult(
       "read_session",
       {
         sessionId,
-        source: flagString(flags, "source") || "agy",
         mode: flagString(flags, "mode") || "digest",
         startStep: parseOptionalInt(flags["start-step"]),
         endStep: parseOptionalInt(flags["end-step"]),
@@ -4863,79 +4289,90 @@ function runCliMode(argv) {
         startSeq: parseOptionalInt(flags["start-seq"]),
         endSeq: parseOptionalInt(flags["end-seq"]),
         query: flagString(flags, "query"),
-        includeTools: Boolean(flags.tools),
-        includeThinking: Boolean(flags.thinking),
+        includeTools: toolsFlag.value,
+        includeThinking: thinkingFlag.value,
         artifactName: flagString(flags, "artifact"),
         startLine: parseOptionalInt(flags["start-line"]),
         endLine: parseOptionalInt(flags["end-line"]),
         maxChars: parseOptionalInt(flags["max-chars"])
       },
-      dataDirOpt
+      execOpts
     );
     process.stdout.write(`${text}
 `);
     if (isError) process.exitCode = 1;
     return;
   }
-  if (sub === "note-save") {
-    const tagsRaw = flagString(flags, "tags");
+  if (sub === "board-read") {
     const { text, isError } = executeToolResult(
-      "save_note",
+      "board_read",
       {
-        topic: flagString(flags, "topic") || positional[1] || "",
-        content: flagString(flags, "content") || positional.slice(2).join(" ") || "",
-        workspace: flagString(flags, "workspace"),
-        tags: tagsRaw ? tagsRaw.split(",") : [],
-        id: flagString(flags, "id"),
-        deleteId: flagString(flags, "delete")
-      },
-      dataDirOpt
-    );
-    process.stdout.write(`${text}
-`);
-    if (isError) process.exitCode = 1;
-    return;
-  }
-  if (sub === "note-recall") {
-    const { text, isError } = executeToolResult(
-      "recall_notes",
-      {
+        conversationId: flagString(flags, "conversation"),
+        scope: flagString(flags, "scope") || "all",
+        keys: flagString(flags, "keys"),
         query: positional.slice(1).join(" ") || flagString(flags, "query"),
-        workspace: flagString(flags, "workspace"),
-        tag: flagString(flags, "tag"),
-        limit: parseOptionalInt(flags.limit)
+        offset: parseOptionalInt(flags.offset),
+        maxChars: parseOptionalInt(flags["max-chars"])
       },
-      dataDirOpt
+      execOpts
     );
     process.stdout.write(`${text}
 `);
     if (isError) process.exitCode = 1;
     return;
   }
-  if (sub === "stats" || sub === "benchmark") {
-    const report = analyzeMemoryUsage({
-      ...dataDirOpt,
-      recent: parseOptionalInt(flags.recent) || 50,
-      includeChildren: Boolean(flags["include-children"])
-    });
-    if (flags.json) {
-      process.stdout.write(`${JSON.stringify(report, null, 2)}
+  if (sub === "board-post") {
+    const deleteFlag = parseBoolFlag(flags, "delete");
+    if (failBool(deleteFlag)) return;
+    const { text, isError } = executeToolResult(
+      "board_post",
+      {
+        key: flagString(flags, "key") || positional[1] || "",
+        title: flagString(flags, "title"),
+        body: flagString(flags, "body") || positional.slice(2).join(" ") || "",
+        conversationId: flagString(flags, "conversation"),
+        step: parseOptionalInt(flags.step),
+        scope: flagString(flags, "scope") || "project",
+        expectedRevision: flagString(flags, "rev"),
+        delete: deleteFlag.value
+      },
+      execOpts
+    );
+    process.stdout.write(`${text}
 `);
-    } else {
-      process.stdout.write(`${formatMemoryUsageMarkdown(report)}
+    if (isError) process.exitCode = 1;
+    return;
+  }
+  if (sub === "migrate-notes") {
+    const rawTarget = flagString(flags, "scope") || "global";
+    const parsedTarget = parseExplicitScopeKey(rawTarget);
+    if (!parsedTarget) {
+      process.stderr.write(`Error: Invalid target --scope "${rawTarget}". Use "global", "project/<id>", "cli_repo/<gitDir>", or "cli_workspace/<dir>".
 `);
+      process.exitCode = 1;
+      return;
     }
+    const sourceDataDir = flagString(flags, "data-dir") || resolveDataDir();
+    const res = migrateLegacyNotes({
+      sourceDataDir,
+      targetScope: parsedTarget,
+      boardsHome: execOpts.boardsHome
+    });
+    process.stdout.write(
+      `Migrated legacy notes from ${sourceDataDir}: imported=${res.imported}, skipped=${res.skipped}
+${res.details.join("\n")}
+`
+    );
     return;
   }
   process.stdout.write(
     [
       `agy-memory v${SERVER_INFO.version} CLI usage:`,
-      "  node dist/mcp-server.mjs --cli list [--source agy|codex|claude|all] [--workspace <dir>] [--min-steps 5] [--exclude <id>] [--limit 15] [query]",
-      "  node dist/mcp-server.mjs --cli search [--mode text|file_history|error_history] [--source agy|codex|claude|all] [--scope all|user|assistant|artifacts|swarm] [--session <id>] [--exclude <id>] [--workspace <dir>] <query>",
-      "  node dist/mcp-server.mjs --cli read <sessionId> [--source agy|codex|claude|all] [--mode digest|turns|artifacts|swarm] [--tail 20] [--start-seq N] [--end-seq N] [--query <q>] [--char-offset N]",
-      "  node dist/mcp-server.mjs --cli note-save --topic <title> --content <text> [--workspace <dir>] [--tags a,b]",
-      "  node dist/mcp-server.mjs --cli note-recall [query] [--workspace <dir>] [--tag <tag>]",
-      "  node dist/mcp-server.mjs --cli stats [--recent 50] [--json]"
+      "  node dist/mcp-server.mjs --cli board-read [--conversation <id> | --scope global|project/<id>] [--keys a,b] [query]",
+      "  node dist/mcp-server.mjs --cli board-post --key <slug> --body <md> [--title <t>] [--conversation <id> | --scope global|project/<id>] [--rev <hash>] [--delete]",
+      "  node dist/mcp-server.mjs --cli search [--mode text|file_history|error_history] [--conversation <id>] [--all-scopes] [--workspace <dir>] [--limit 10] [query]",
+      "  node dist/mcp-server.mjs --cli read <sessionId> [--mode digest|turns|artifacts|swarm] [--tail 20] [--start-seq N] [--end-seq N] [--char-offset N]",
+      "  node dist/mcp-server.mjs --cli migrate-notes --scope global|project/<id> [--data-dir <dir>]"
     ].join("\n") + "\n"
   );
 }

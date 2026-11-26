@@ -1,9 +1,11 @@
-import { analyzeMemoryUsage, formatMemoryUsageMarkdown } from "./analytics.js";
+import { migrateLegacyNotes } from "./board.js";
+import { parseExplicitScopeKey } from "./scope.js";
+import { resolveDataDir } from "./store.js";
 import { executeToolResult, TOOL_DEFINITIONS } from "./tools.js";
 
 const SERVER_INFO = {
   name: "agy-memory",
-  version: "0.3.0",
+  version: "0.4.1",
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS = new Set([
@@ -44,7 +46,6 @@ function handleJsonRpcMessage(msg: unknown): JsonRpcResponse | null {
       ? (record.params as Record<string, unknown>)
       : {};
 
-  // Validate method before notification early-return if an explicit id is present
   if (typeof method !== "string" || !method.trim()) {
     return {
       jsonrpc: "2.0",
@@ -56,7 +57,6 @@ function handleJsonRpcMessage(msg: unknown): JsonRpcResponse | null {
     };
   }
 
-  // Notifications carry no id (or null id for notifications/*) and expect no reply.
   if (!hasId || id === null) {
     return null;
   }
@@ -77,7 +77,7 @@ function handleJsonRpcMessage(msg: unknown): JsonRpcResponse | null {
           },
           serverInfo: SERVER_INFO,
           instructions:
-            "Local cross-conversation memory for Google Antigravity (agy), Codex, and Claude Code. Browse recent IDs with list_sessions, find matching sessions/edits/errors with search_sessions (use mode='error_history' for failed commands/tests), inspect one session with read_session (digest -> turns/artifacts/swarm), and manage durable Markdown notes with recall_notes and save_note (pass expectedRevision for CAS updates/deletes).",
+            "Project Blackboard and Verbatim Session Archive for Google Antigravity. Read/update active project decisions and handoffs with board_read and board_post (pass conversationId from [agy-memory] startup header; pass expectedRevision to update or delete). List or search past sessions/edits/errors with search_sessions (omit query to list; use mode='error_history' for failures) and inspect one session with read_session.",
         },
       };
     }
@@ -159,146 +159,101 @@ function runMcpStdioServer(): void {
   let rawBuf: Buffer = Buffer.alloc(0);
   let framingMode: "lsp" | "jsonl" | null = null;
 
-  const writeResponse = (obj: JsonRpcResponse | JsonRpcResponse[] | null): void => {
-    if (!obj) return;
-    const body = JSON.stringify(obj);
+  const sendResponse = (resp: JsonRpcResponse | null): void => {
+    if (!resp) return;
+    const payload = JSON.stringify(resp);
     if (framingMode === "lsp") {
-      const len = Buffer.byteLength(body, "utf8");
-      process.stdout.write(`Content-Length: ${len}\r\n\r\n${body}`);
+      const byteLen = Buffer.byteLength(payload, "utf8");
+      process.stdout.write(`Content-Length: ${byteLen}\r\n\r\n${payload}`);
     } else {
-      process.stdout.write(`${body}\n`);
+      process.stdout.write(`${payload}\n`);
     }
   };
 
-  const writeParseError = (): void => {
-    writeResponse({
-      jsonrpc: "2.0",
-      id: null,
-      error: {
-        code: -32700,
-        message: "Parse error",
-      },
-    });
-  };
-
-  const dispatchParsed = (parsed: unknown): void => {
-    if (Array.isArray(parsed)) {
-      if (parsed.length === 0) {
-        writeResponse({
-          jsonrpc: "2.0",
-          id: null,
-          error: { code: -32600, message: "Invalid Request: empty batch" },
-        });
-        return;
-      }
-      const replies = parsed.map(handleJsonRpcMessage).filter((r): r is JsonRpcResponse => r !== null);
-      if (replies.length > 0) writeResponse(replies);
+  const dispatchRawJson = (rawText: string): void => {
+    const trimmed = rawText.trim();
+    if (!trimmed) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      sendResponse({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32700, message: "Parse error" },
+      });
       return;
     }
-    const reply = handleJsonRpcMessage(parsed);
-    if (reply) writeResponse(reply);
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) sendResponse(handleJsonRpcMessage(item));
+    } else {
+      sendResponse(handleJsonRpcMessage(parsed));
+    }
   };
 
-  const drainBuffer = (isEof = false): void => {
+  const processBuffer = (): void => {
     while (rawBuf.length > 0) {
-      if (framingMode !== "lsp") {
-        let trimStart = 0;
-        while (
-          trimStart < rawBuf.length &&
-          (rawBuf[trimStart] === 0x20 ||
-            rawBuf[trimStart] === 0x09 ||
-            rawBuf[trimStart] === 0x0d ||
-            rawBuf[trimStart] === 0x0a)
-        ) {
-          trimStart += 1;
-        }
-        if (trimStart > 0) rawBuf = rawBuf.subarray(trimStart);
-        if (rawBuf.length === 0) return;
+      let lead = 0;
+      while (lead < rawBuf.length && (rawBuf[lead] === 0x0d || rawBuf[lead] === 0x0a)) {
+        lead += 1;
       }
+      if (lead > 0) rawBuf = rawBuf.subarray(lead);
+      if (rawBuf.length === 0) return;
 
-      if (!framingMode) {
-        if (rawBuf[0] === 0x7b || rawBuf[0] === 0x5b) {
-          framingMode = "jsonl";
-        } else {
-          const head = rawBuf.subarray(0, 64).toString("ascii");
-          if (/^(?:content-length|content-type|[a-z][a-z0-9-]*)\s*:/i.test(head)) {
-            framingMode = "lsp";
-          } else if (!isEof && rawBuf.length < 32 && rawBuf.indexOf(0x0a) === -1) {
-            return;
-          } else {
-            framingMode = "jsonl";
-          }
-        }
-      }
-
-      if (framingMode === "lsp") {
-        // Trim any leading blank lines between LSP frames
-        let trimStart = 0;
-        while (
-          trimStart < rawBuf.length &&
-          (rawBuf[trimStart] === 0x0d || rawBuf[trimStart] === 0x0a)
-        ) {
-          trimStart += 1;
-        }
-        if (trimStart > 0) rawBuf = rawBuf.subarray(trimStart);
-        if (rawBuf.length === 0) return;
-
+      const firstByte = rawBuf[0]!;
+      const looksLikeJson = firstByte === 0x7b || firstByte === 0x5b;
+      if (!looksLikeJson) {
         const sep = findHeaderSeparator(rawBuf);
         if (!sep) return;
-        const headerText = rawBuf.subarray(0, sep.idx).toString("ascii");
-        const m = /content-length:\s*(\d+)/i.exec(headerText);
-        if (!m || !m[1]) {
-          rawBuf = rawBuf.subarray(sep.idx + sep.sepLen);
-          writeParseError();
+        const headerBlock = rawBuf.subarray(0, sep.idx).toString("ascii");
+        const lenMatch = /content-length:\s*(\d+)/i.exec(headerBlock);
+        if (lenMatch) {
+          framingMode = "lsp";
+          const bodyLen = Number.parseInt(lenMatch[1]!, 10);
+          const bodyStart = sep.idx + sep.sepLen;
+          if (rawBuf.length < bodyStart + bodyLen) return;
+          const bodyStr = rawBuf.subarray(bodyStart, bodyStart + bodyLen).toString("utf8");
+          rawBuf = rawBuf.subarray(bodyStart + bodyLen);
+          dispatchRawJson(bodyStr);
           continue;
         }
-        const contentLen = Number(m[1]);
-        const bodyStart = sep.idx + sep.sepLen;
-        const totalNeeded = bodyStart + contentLen;
-        if (rawBuf.length < totalNeeded) return;
-        const jsonText = rawBuf.subarray(bodyStart, totalNeeded).toString("utf8");
-        rawBuf = rawBuf.subarray(totalNeeded);
-        try {
-          dispatchParsed(JSON.parse(jsonText));
-        } catch {
-          writeParseError();
-        }
-      } else {
-        const nlIdx = rawBuf.indexOf(0x0a);
-        let lineBuf: Buffer;
-        if (nlIdx === -1) {
-          if (!isEof) return;
-          lineBuf = rawBuf;
-          rawBuf = Buffer.alloc(0);
-        } else {
-          lineBuf = rawBuf.subarray(0, nlIdx);
-          rawBuf = rawBuf.subarray(nlIdx + 1);
-        }
-        const line = lineBuf.toString("utf8").trim();
-        if (!line) continue;
-        try {
-          dispatchParsed(JSON.parse(line));
-        } catch {
-          writeParseError();
-        }
       }
+
+      const nlIdx = rawBuf.indexOf(0x0a);
+      if (nlIdx === -1) return;
+      if (!framingMode) framingMode = "jsonl";
+      const lineStr = rawBuf.subarray(0, nlIdx).toString("utf8");
+      rawBuf = rawBuf.subarray(nlIdx + 1);
+      dispatchRawJson(lineStr);
     }
   };
 
   process.stdin.on("data", (chunk: Buffer | string) => {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
-    rawBuf = rawBuf.length === 0 ? buf : Buffer.concat([rawBuf, buf]);
-    drainBuffer(false);
+    const bufChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
+    rawBuf = Buffer.concat([rawBuf, bufChunk]);
+    processBuffer();
   });
 
   process.stdin.on("end", () => {
-    drainBuffer(true);
-    // Let buffered stdout flush cleanly instead of calling abrupt process.exit(0)
-    if (process.stdout.writable && !process.stdout.writableEnded) {
-      process.stdout.end();
+    if (rawBuf.length > 0) {
+      const rem = rawBuf.toString("utf8").trim();
+      if (rem && (rem.startsWith("{") || rem.startsWith("["))) {
+        if (!framingMode) framingMode = "jsonl";
+        dispatchRawJson(rem);
+      }
     }
   });
 }
+
+const BOOLEAN_CLI_FLAGS = new Set([
+  "all-scopes",
+  "regex",
+  "include-children",
+  "include-tools",
+  "include-thinking",
+  "delete",
+  "dry-run",
+]);
 
 function parseCliArgs(argv: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
   const positional: string[] = [];
@@ -312,7 +267,7 @@ function parseCliArgs(argv: string[]): { positional: string[]; flags: Record<str
       } else {
         const key = tok.slice(2);
         const next = argv[i + 1];
-        if (next !== undefined && !next.startsWith("--")) {
+        if (!BOOLEAN_CLI_FLAGS.has(key) && next !== undefined && !next.startsWith("--")) {
           flags[key] = next;
           i += 1;
         } else {
@@ -337,53 +292,59 @@ function flagString(flags: Record<string, string | boolean>, key: string): strin
   return typeof v === "string" ? v : "";
 }
 
+function parseBoolFlag(
+  flags: Record<string, string | boolean>,
+  key: string,
+): { value: boolean; error?: string } {
+  const v = flags[key];
+  if (v === undefined || v === false) return { value: false };
+  if (v === true) return { value: true };
+  const low = String(v).trim().toLowerCase();
+  if (low === "true" || low === "1") return { value: true };
+  if (low === "false" || low === "0") return { value: false };
+  return { value: false, error: `Error: Invalid boolean value "${v}" for --${key}. Use true or false.` };
+}
+
 function runCliMode(argv: string[]): void {
   const { positional, flags } = parseCliArgs(argv);
   const sub = (positional[0] || "help").toLowerCase();
-  const dataDirFlag = flagString(flags, "data-dir");
-  const dataDirOpt = dataDirFlag ? { dataDir: dataDirFlag } : {};
+  const execOpts = {
+    ...(flagString(flags, "data-dir") ? { dataDir: flagString(flags, "data-dir") } : {}),
+    ...(flagString(flags, "boards-home") ? { boardsHome: flagString(flags, "boards-home") } : {}),
+  };
 
-  if (sub === "list") {
-    const { text, isError } = executeToolResult(
-      "list_sessions",
-      {
-        source: flagString(flags, "source") || "agy",
-        workspace: flagString(flags, "workspace"),
-        query: positional.slice(1).join(" ") || flagString(flags, "query"),
-        includeChildren: Boolean(flags["include-children"]),
-        excludeSessionId: flagString(flags, "exclude"),
-        sinceHours: parseOptionalInt(flags["since-hours"]),
-        minSteps: parseOptionalInt(flags["min-steps"]),
-        limit: parseOptionalInt(flags.limit),
-        maxChars: parseOptionalInt(flags["max-chars"]),
-      },
-      dataDirOpt,
-    );
-    process.stdout.write(`${text}\n`);
-    if (isError) process.exitCode = 1;
-    return;
-  }
+  const failBool = (res: { value: boolean; error?: string }): boolean => {
+    if (!res.error) return false;
+    process.stderr.write(`${res.error}\n`);
+    process.exitCode = 1;
+    return true;
+  };
 
-  if (sub === "search") {
+  if (sub === "list" || sub === "search") {
+    const regexFlag = parseBoolFlag(flags, "regex");
+    const allScopesFlag = parseBoolFlag(flags, "all-scopes");
+    const includeChildrenFlag = parseBoolFlag(flags, "include-children");
+    if (failBool(regexFlag) || failBool(allScopesFlag) || failBool(includeChildrenFlag)) return;
     const query = positional.slice(1).join(" ") || flagString(flags, "query");
     const { text, isError } = executeToolResult(
       "search_sessions",
       {
-        query,
+        query: sub === "list" && !query ? "" : query,
         mode: flagString(flags, "mode") || "text",
-        source: flagString(flags, "source") || "agy",
         scope: flagString(flags, "scope") || "all",
-        regex: Boolean(flags.regex),
+        regex: regexFlag.value,
+        conversationId: flagString(flags, "conversation"),
+        scopeKey: flagString(flags, "scope-key"),
+        allScopes: allScopesFlag.value,
         sessionId: flagString(flags, "session"),
         workspace: flagString(flags, "workspace"),
-        includeChildren: Boolean(flags["include-children"]),
+        includeChildren: includeChildrenFlag.value,
         excludeSessionId: flagString(flags, "exclude"),
         sinceDays: parseOptionalInt(flags["since-days"]),
         maxSessions: parseOptionalInt(flags.limit),
-        maxSnippetsPerSession: parseOptionalInt(flags["max-snippets"]),
         maxChars: parseOptionalInt(flags["max-chars"]),
       },
-      dataDirOpt,
+      execOpts,
     );
     process.stdout.write(`${text}\n`);
     if (isError) process.exitCode = 1;
@@ -391,12 +352,14 @@ function runCliMode(argv: string[]): void {
   }
 
   if (sub === "read") {
+    const toolsFlag = parseBoolFlag(flags, "tools");
+    const thinkingFlag = parseBoolFlag(flags, "thinking");
+    if (failBool(toolsFlag) || failBool(thinkingFlag)) return;
     const sessionId = positional[1] || flagString(flags, "session");
     const { text, isError } = executeToolResult(
       "read_session",
       {
         sessionId,
-        source: flagString(flags, "source") || "agy",
         mode: flagString(flags, "mode") || "digest",
         startStep: parseOptionalInt(flags["start-step"]),
         endStep: parseOptionalInt(flags["end-step"]),
@@ -406,78 +369,88 @@ function runCliMode(argv: string[]): void {
         startSeq: parseOptionalInt(flags["start-seq"]),
         endSeq: parseOptionalInt(flags["end-seq"]),
         query: flagString(flags, "query"),
-        includeTools: Boolean(flags.tools),
-        includeThinking: Boolean(flags.thinking),
+        includeTools: toolsFlag.value,
+        includeThinking: thinkingFlag.value,
         artifactName: flagString(flags, "artifact"),
         startLine: parseOptionalInt(flags["start-line"]),
         endLine: parseOptionalInt(flags["end-line"]),
         maxChars: parseOptionalInt(flags["max-chars"]),
       },
-      dataDirOpt,
+      execOpts,
     );
     process.stdout.write(`${text}\n`);
     if (isError) process.exitCode = 1;
     return;
   }
 
-  if (sub === "note-save") {
-    const tagsRaw = flagString(flags, "tags");
+  if (sub === "board-read") {
     const { text, isError } = executeToolResult(
-      "save_note",
+      "board_read",
       {
-        topic: flagString(flags, "topic") || positional[1] || "",
-        content: flagString(flags, "content") || positional.slice(2).join(" ") || "",
-        workspace: flagString(flags, "workspace"),
-        tags: tagsRaw ? tagsRaw.split(",") : [],
-        id: flagString(flags, "id"),
-        deleteId: flagString(flags, "delete"),
-      },
-      dataDirOpt,
-    );
-    process.stdout.write(`${text}\n`);
-    if (isError) process.exitCode = 1;
-    return;
-  }
-
-  if (sub === "note-recall") {
-    const { text, isError } = executeToolResult(
-      "recall_notes",
-      {
+        conversationId: flagString(flags, "conversation"),
+        scope: flagString(flags, "scope") || "all",
+        keys: flagString(flags, "keys"),
         query: positional.slice(1).join(" ") || flagString(flags, "query"),
-        workspace: flagString(flags, "workspace"),
-        tag: flagString(flags, "tag"),
-        limit: parseOptionalInt(flags.limit),
+        offset: parseOptionalInt(flags.offset),
+        maxChars: parseOptionalInt(flags["max-chars"]),
       },
-      dataDirOpt,
+      execOpts,
     );
     process.stdout.write(`${text}\n`);
     if (isError) process.exitCode = 1;
     return;
   }
 
-  if (sub === "stats" || sub === "benchmark") {
-    const report = analyzeMemoryUsage({
-      ...dataDirOpt,
-      recent: parseOptionalInt(flags.recent) || 50,
-      includeChildren: Boolean(flags["include-children"]),
-    });
-    if (flags.json) {
-      process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-    } else {
-      process.stdout.write(`${formatMemoryUsageMarkdown(report)}\n`);
+  if (sub === "board-post") {
+    const deleteFlag = parseBoolFlag(flags, "delete");
+    if (failBool(deleteFlag)) return;
+    const { text, isError } = executeToolResult(
+      "board_post",
+      {
+        key: flagString(flags, "key") || positional[1] || "",
+        title: flagString(flags, "title"),
+        body: flagString(flags, "body") || positional.slice(2).join(" ") || "",
+        conversationId: flagString(flags, "conversation"),
+        step: parseOptionalInt(flags.step),
+        scope: flagString(flags, "scope") || "project",
+        expectedRevision: flagString(flags, "rev"),
+        delete: deleteFlag.value,
+      },
+      execOpts,
+    );
+    process.stdout.write(`${text}\n`);
+    if (isError) process.exitCode = 1;
+    return;
+  }
+
+  if (sub === "migrate-notes") {
+    const rawTarget = flagString(flags, "scope") || "global";
+    const parsedTarget = parseExplicitScopeKey(rawTarget);
+    if (!parsedTarget) {
+      process.stderr.write(`Error: Invalid target --scope "${rawTarget}". Use "global", "project/<id>", "cli_repo/<gitDir>", or "cli_workspace/<dir>".\n`);
+      process.exitCode = 1;
+      return;
     }
+    const sourceDataDir = flagString(flags, "data-dir") || resolveDataDir();
+    const res = migrateLegacyNotes({
+      sourceDataDir,
+      targetScope: parsedTarget,
+      boardsHome: execOpts.boardsHome,
+    });
+    process.stdout.write(
+      `Migrated legacy notes from ${sourceDataDir}: imported=${res.imported}, skipped=${res.skipped}\n${res.details.join("\n")}\n`,
+    );
     return;
   }
 
   process.stdout.write(
     [
       `agy-memory v${SERVER_INFO.version} CLI usage:`,
-      "  node dist/mcp-server.mjs --cli list [--source agy|codex|claude|all] [--workspace <dir>] [--min-steps 5] [--exclude <id>] [--limit 15] [query]",
-      "  node dist/mcp-server.mjs --cli search [--mode text|file_history|error_history] [--source agy|codex|claude|all] [--scope all|user|assistant|artifacts|swarm] [--session <id>] [--exclude <id>] [--workspace <dir>] <query>",
-      "  node dist/mcp-server.mjs --cli read <sessionId> [--source agy|codex|claude|all] [--mode digest|turns|artifacts|swarm] [--tail 20] [--start-seq N] [--end-seq N] [--query <q>] [--char-offset N]",
-      "  node dist/mcp-server.mjs --cli note-save --topic <title> --content <text> [--workspace <dir>] [--tags a,b]",
-      "  node dist/mcp-server.mjs --cli note-recall [query] [--workspace <dir>] [--tag <tag>]",
-      "  node dist/mcp-server.mjs --cli stats [--recent 50] [--json]",
+      "  node dist/mcp-server.mjs --cli board-read [--conversation <id> | --scope global|project/<id>] [--keys a,b] [query]",
+      "  node dist/mcp-server.mjs --cli board-post --key <slug> --body <md> [--title <t>] [--conversation <id> | --scope global|project/<id>] [--rev <hash>] [--delete]",
+      "  node dist/mcp-server.mjs --cli search [--mode text|file_history|error_history] [--conversation <id>] [--all-scopes] [--workspace <dir>] [--limit 10] [query]",
+      "  node dist/mcp-server.mjs --cli read <sessionId> [--mode digest|turns|artifacts|swarm] [--tail 20] [--start-seq N] [--end-seq N] [--char-offset N]",
+      "  node dist/mcp-server.mjs --cli migrate-notes --scope global|project/<id> [--data-dir <dir>]",
     ].join("\n") + "\n",
   );
 }

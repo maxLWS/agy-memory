@@ -46,7 +46,7 @@ test("scripts/install.mjs installs standalone runtime bundle, preserves AGENTS.l
     // 4) Status & uninstall
     const st = spawnSync(process.execPath, [installer, "status", "--dir", targetDir], { encoding: "utf8" });
     assert.equal(st.status, 0, st.stdout);
-    assert.ok(st.stdout.includes("installed v0.3.0"), st.stdout);
+    assert.ok(st.stdout.includes("installed v0.4.1"), st.stdout);
 
     const un = spawnSync(process.execPath, [installer, "uninstall", "--dir", targetDir], { encoding: "utf8" });
     assert.equal(un.status, 0, un.stdout);

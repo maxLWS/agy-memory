@@ -1,12 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
-  checkScanBudget,
-  createScanBudget,
-  resolveToolPath,
-  streamJsonlFromOffset,
-} from "./adapters.js";
-import {
   cleanUserRequestText,
   formatRelativeTime,
   formatShortDate,
@@ -15,6 +9,12 @@ import {
   parseQueryTokens,
   truncateUtf8,
 } from "./store.js";
+import {
+  checkScanBudget,
+  createScanBudget,
+  resolveToolPath,
+  streamJsonlFromOffset,
+} from "./stream.js";
 import type {
   FileActionOutcome,
   ScanBudget,
@@ -28,6 +28,16 @@ import type {
 
 const MAX_TRACE_CACHE = 48;
 const IS_WIN = process.platform === "win32";
+
+const SINGLE_WRITE_TOOLS = new Set([
+  "edit_file",
+  "write_file",
+  "replace_file_content",
+  "multi_replace_file_content",
+  "write_to_file",
+]);
+
+const SINGLE_READ_TOOLS = new Set(["read_file", "view_file"]);
 
 interface PendingToolCall {
   stepIndex: number;
@@ -67,7 +77,7 @@ function lruPutTrace(key: string, val: AgyTraceCacheEntry): void {
   }
 }
 
-function unwrapAgyArgValue(v: unknown): unknown {
+function unwrapArgValue(v: unknown): unknown {
   if (typeof v !== "string") return v;
   const trimmed = v.trim();
   if (
@@ -97,12 +107,12 @@ function parseArgsRecord(raw: unknown): Record<string, unknown> {
   }
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj)) {
-    out[k] = unwrapAgyArgValue(v);
+    out[k] = unwrapArgValue(v);
   }
   return out;
 }
 
-function extractAgyPaths(toolName: string, args: Record<string, unknown>): Array<{ path: string; isWrite: boolean }> {
+function extractFileToolPaths(toolName: string, args: Record<string, unknown>): Array<{ path: string; isWrite: boolean }> {
   const low = toolName.toLowerCase();
   const out: Array<{ path: string; isWrite: boolean }> = [];
   const cwd = typeof args.cwd === "string" ? args.cwd.trim() : "";
@@ -117,17 +127,11 @@ function extractAgyPaths(toolName: string, args: Record<string, unknown>): Array
     out.push({ path: joined, isWrite });
   };
 
-  if (
-    low === "edit_file" ||
-    low === "write_file" ||
-    low === "replace_file_content" ||
-    low === "multi_replace_file_content" ||
-    low === "write_to_file"
-  ) {
+  if (SINGLE_WRITE_TOOLS.has(low)) {
     pushPath(args.Path ?? args.TargetFile ?? args.path, true);
     return out;
   }
-  if (low === "mcp_agy-fast_fast_apply_edits" || low === "apply_edits") {
+  if (low === "apply_edits" || low.endsWith("_apply_edits")) {
     if (Array.isArray(args.edits)) {
       for (const e of args.edits) {
         if (e && typeof e === "object") pushPath((e as Record<string, unknown>).path, true);
@@ -135,17 +139,17 @@ function extractAgyPaths(toolName: string, args: Record<string, unknown>): Array
     }
     return out;
   }
-  if (low === "read_file" || low === "view_file") {
+  if (SINGLE_READ_TOOLS.has(low)) {
     pushPath(args.Path ?? args.AbsolutePath ?? args.path, false);
     return out;
   }
-  if (low === "mcp_agy-fast_fast_quick_outline" || low === "quick_outline") {
+  if (low === "quick_outline" || low.endsWith("_quick_outline")) {
     if (Array.isArray(args.paths)) {
       for (const p of args.paths) pushPath(p, false);
     }
     return out;
   }
-  if (low === "mcp_agy-fast_fast_read_slices" || low === "read_slices") {
+  if (low === "read_slices" || low.endsWith("_read_slices")) {
     if (Array.isArray(args.outlines)) {
       for (const p of args.outlines) pushPath(p, false);
     }
@@ -159,7 +163,7 @@ function extractAgyPaths(toolName: string, args: Record<string, unknown>): Array
   return out;
 }
 
-function stripAgyTimestampHeader(text: string): string {
+function stripTimestampHeader(text: string): string {
   return text
     .replace(/^(?:(?:Created At|Completed At):\s*[^\n]+\n?)+/gi, "")
     .replace(/\s+/g, " ")
@@ -169,24 +173,23 @@ function stripAgyTimestampHeader(text: string): string {
 function isLikelyToolResponse(rawGeneric: string): boolean {
   if (!rawGeneric.trim()) return false;
   if (/^(?:Created At|Completed At):/i.test(rawGeneric)) return true;
-  if (/^(?:Made \d+ replacement|Created file\.|Appended to file\.|Overwrote file\.|Showing lines |Command exited with code|The tool's output was truncated|Successfully |Encountered error in tool execution|Error:|Applied \d+ edit)/i.test(rawGeneric.trim())) {
+  if (
+    /^(?:Made \d+ replacement|Created file\.|Appended to file\.|Overwrote file\.|Showing lines |Command exited with code|The tool's output was truncated|Successfully |Encountered error in tool execution|Error:|Applied \d+ edit)/i.test(
+      rawGeneric.trim(),
+    )
+  ) {
     return true;
   }
-  // Ignore obvious non-tool system/control notices so pendingBatch attribution does not shift
   if (/^<(?:SYSTEM_MESSAGE|USER_REQUEST|CONTEXT_SUMMARY)/i.test(rawGeneric.trim())) return false;
   return true;
 }
 
-/**
- * Requires positive evidence to certify a write or command pass; unrecognized/empty
- * responses are marked "unverified" rather than silently promoted to succeeded.
- */
-function parseAgyGenericOutcome(content: string): {
+function parseGenericOutcome(content: string): {
   status: "succeeded" | "failed" | "unverified";
   exitCode: number | null;
   snippet: string;
 } {
-  const cleaned = stripAgyTimestampHeader(content);
+  const cleaned = stripTimestampHeader(content);
   if (!cleaned) {
     return { status: "unverified", exitCode: null, snippet: "" };
   }
@@ -210,7 +213,6 @@ function parseAgyGenericOutcome(content: string): {
     return { status: "failed", exitCode: null, snippet: cleaned.slice(0, 260) };
   }
 
-  // Positive confirmation patterns emitted by agy write/edit tools and agy-fast apply_edits
   if (
     /^(?:Made \d+ replacement|Created file\.|Appended to file\.|Overwrote file\.|Successfully (?:edited|wrote|created|applied)|Applied \d+ edit|Edited \d+ file|All \d+ edit|OK\b)/i.test(
       cleaned,
@@ -223,10 +225,6 @@ function parseAgyGenericOutcome(content: string): {
   return { status: "unverified", exitCode: null, snippet: "" };
 }
 
-/**
- * Full-invocation command key (preserves test targets, paths, and working directory)
- * so passing an unrelated test target never marks a different failing command as PASSED.
- */
 function buildFullCommandKey(cmdLine: string, cwd: string): string {
   const compactCmd = String(cmdLine || "").replace(/\s+/g, " ").trim();
   const compactCwd = String(cwd || "").replace(/\\/g, "/").replace(/\/+$/, "").trim();
@@ -237,7 +235,6 @@ function pickMatchingPendingCall(batch: PendingToolCall[], cleanedOutput: string
   if (batch.length === 0) return undefined;
   if (batch.length === 1) return batch.shift();
 
-  // If output explicitly names an edited path (e.g. "Made 1 replacement in /a/b.ts"), match that call directly
   const editPathMatch = /Made \d+ replacement(?:s)? in ([^\s]+)\s+starting at/i.exec(cleanedOutput);
   if (editPathMatch?.[1]) {
     const outPath = editPathMatch[1].replace(/\\/g, "/");
@@ -253,9 +250,6 @@ function pickMatchingPendingCall(batch: PendingToolCall[], cleanedOutput: string
 }
 
 export function extractSessionTraceDoc(entry: SessionEntry, budget?: ScanBudget): SessionTraceDoc {
-  if (entry.source !== "agy") {
-    return { fileEvents: [], errorEvents: [], passEvents: [] };
-  }
   const filePath = entry.paths.transcriptPath;
   let st: fs.Stats;
   try {
@@ -279,7 +273,6 @@ export function extractSessionTraceDoc(entry: SessionEntry, budget?: ScanBudget)
     return cached.state.doc;
   }
   if (canReuseExact && !cached.eof) {
-    // Preserve partial progress from an earlier budget-capped scan
     state = cached.state;
     startOffset = cached.offset;
   } else if (canResumeAppend) {
@@ -299,12 +292,12 @@ export function extractSessionTraceDoc(entry: SessionEntry, budget?: ScanBudget)
     if (state.pendingBatch.length === 0) return;
     if (!isLikelyToolResponse(genericContent)) return;
 
-    const cleaned = stripAgyTimestampHeader(genericContent);
+    const cleaned = stripTimestampHeader(genericContent);
     const call = pickMatchingPendingCall(state.pendingBatch, cleaned);
     if (!call) return;
 
-    const outcome = parseAgyGenericOutcome(genericContent);
-    const pathHits = extractAgyPaths(call.name, call.args);
+    const outcome = parseGenericOutcome(genericContent);
+    const pathHits = extractFileToolPaths(call.name, call.args);
     for (const ph of pathHits) {
       const norm = resolveToolPath(ph.path, primaryWs);
       if (!norm.resolvedPath) continue;
@@ -331,7 +324,8 @@ export function extractSessionTraceDoc(entry: SessionEntry, budget?: ScanBudget)
 
     const cmdLine = String(call.args.CommandLine || call.args.command || "").trim();
     const cmdCwd = String(call.args.Cwd || call.args.cwd || primaryWs || "").trim();
-    const isCmd = call.name === "run_command" || call.name === "mcp_agy-fast_fast_run_checks";
+    const lowName = call.name.toLowerCase();
+    const isCmd = lowName === "run_command" || lowName.endsWith("_run_checks");
     const invocation = cmdLine
       ? cmdLine.split(/\r?\n/)[0]!.slice(0, 160)
       : pathHits[0]
@@ -339,7 +333,7 @@ export function extractSessionTraceDoc(entry: SessionEntry, budget?: ScanBudget)
         : call.name;
     const cmdKey = cmdLine
       ? buildFullCommandKey(cmdLine, cmdCwd)
-      : `${call.name.toLowerCase()}:${pathHits[0]?.path || ""}`;
+      : `${lowName}:${pathHits[0]?.path || ""}`;
 
     if (outcome.status === "failed") {
       state.doc.errorEvents.push({
@@ -439,12 +433,11 @@ export function extractSessionTraceDoc(entry: SessionEntry, budget?: ScanBudget)
 export interface TraceSearchOptions {
   eligible: SessionEntry[];
   query: string;
-  sourceCoverage: string;
+  coverageLabel: string;
   maxSessions: number;
   maxChars: number;
   maxScanBytes?: number;
   maxScanMs?: number;
-  workspace?: string;
 }
 
 function normalizeForMatch(p: string): string {
@@ -458,24 +451,14 @@ function matchesTargetFile(ev: TraceFileEvent, queryNorm: string, isBasenameQuer
   if (isBasenameQuery) {
     return baseNorm === queryNorm || resNorm.endsWith(`/${queryNorm}`);
   }
-  // For qualified paths, require exact path match or path-segment suffix (never loose substring)
   return resNorm === queryNorm || resNorm.endsWith(`/${queryNorm}`);
 }
 
 export function runFileHistorySearch(opts: TraceSearchOptions): ToolResult {
-  const { eligible, query, sourceCoverage, maxSessions, maxChars } = opts;
+  const { eligible, query, coverageLabel, maxSessions, maxChars } = opts;
   const cleanQuery = String(query || "").trim().replace(/\\/g, "/").replace(/^["']|["']$/g, "");
   if (!cleanQuery) {
     return { text: "Error: query (file path or filename) is required for mode='file_history'.", isError: true };
-  }
-
-  const agyEligible = eligible.filter((e) => e.source === "agy");
-  const skippedExt = eligible.length - agyEligible.length;
-  if (agyEligible.length === 0 && skippedExt > 0) {
-    return {
-      text: `Trace mode "file_history" currently supports Antigravity (agy) sessions only so every cited #step round-trips through read_session(mode="turns"). Use mode="text" for Codex/Claude sessions.`,
-      isError: true,
-    };
   }
 
   const queryNorm = normalizeForMatch(cleanQuery);
@@ -494,7 +477,7 @@ export function runFileHistorySearch(opts: TraceSearchOptions): ToolResult {
 
   const distinctPaths = new Map<string, { sessions: Set<string>; writes: number; reads: number }>();
 
-  for (const entry of agyEligible) {
+  for (const entry of eligible) {
     if (!checkScanBudget(budget)) break;
     budget.sessionsScanned += 1;
     const doc = extractSessionTraceDoc(entry, budget);
@@ -526,10 +509,9 @@ export function runFileHistorySearch(opts: TraceSearchOptions): ToolResult {
     hits.push({ entry, writes, failedWrites, unverifiedWrites, reads, resolvedPaths });
   }
 
-  const scopeNote = skippedExt > 0 ? `${sourceCoverage}; agy-only for trace` : sourceCoverage;
   const coverageBanner = budget.incomplete
-    ? `INCOMPLETE SCAN (${budget.sessionsScanned}/${agyEligible.length} agy sessions, ${(budget.bytesRead / (1024 * 1024)).toFixed(1)} MB; ${budget.reason}; narrow with workspace/sinceDays — do NOT treat 0-match as authoritative).`
-    : `Complete scan: ${budget.sessionsScanned}/${agyEligible.length} agy sessions (${scopeNote}).`;
+    ? `INCOMPLETE SCAN (${budget.sessionsScanned}/${eligible.length} sessions, ${(budget.bytesRead / (1024 * 1024)).toFixed(1)} MB; ${budget.reason}; narrow with workspace/sinceDays — do NOT treat 0-match as authoritative).`
+    : `Complete scan: ${budget.sessionsScanned}/${eligible.length} sessions (${coverageLabel}).`;
 
   if (hits.length === 0) {
     return {
@@ -577,7 +559,9 @@ export function runFileHistorySearch(opts: TraceSearchOptions): ToolResult {
     const exemplar = h.writes[h.writes.length - 1] || h.unverifiedWrites[0] || h.failedWrites[0] || h.reads[0]!;
     const steps = [...new Set([...h.writes, ...h.unverifiedWrites, ...h.failedWrites].map((x) => `#${x.stepIndex}`))].slice(-6);
     if (steps.length > 0) {
-      lines.push(`Write steps: ${steps.join(", ")} (use read_session(sessionId="${e.shortId}", mode="turns", startStep, endStep) for verbatim context)`);
+      lines.push(
+        `Write steps: ${steps.join(", ")} (use read_session(sessionId="${e.shortId}", mode="turns", startStep, endStep) for verbatim context)`,
+      );
     } else {
       const rSteps = [...new Set(h.reads.map((x) => `#${x.stepIndex}`))].slice(-4);
       lines.push(`Read steps: ${rSteps.join(", ")}`);
@@ -594,19 +578,10 @@ export function runFileHistorySearch(opts: TraceSearchOptions): ToolResult {
 }
 
 export function runErrorHistorySearch(opts: TraceSearchOptions): ToolResult {
-  const { eligible, query, sourceCoverage, maxSessions, maxChars } = opts;
+  const { eligible, query, coverageLabel, maxSessions, maxChars } = opts;
   const terms = parseQueryTokens(query);
   if (terms.length === 0) {
     return { text: "Error: query (error pattern or command keyword) is required for mode='error_history'.", isError: true };
-  }
-
-  const agyEligible = eligible.filter((e) => e.source === "agy");
-  const skippedExt = eligible.length - agyEligible.length;
-  if (agyEligible.length === 0 && skippedExt > 0) {
-    return {
-      text: `Trace mode "error_history" currently supports Antigravity (agy) sessions only so every cited #step round-trips through read_session(mode="turns"). Use mode="text" for Codex/Claude sessions.`,
-      isError: true,
-    };
   }
 
   const budget: ScanBudget = createScanBudget(opts.maxScanBytes, opts.maxScanMs);
@@ -621,7 +596,7 @@ export function runErrorHistorySearch(opts: TraceSearchOptions): ToolResult {
     }>;
   }> = [];
 
-  for (const entry of agyEligible) {
+  for (const entry of eligible) {
     if (!checkScanBudget(budget)) break;
     budget.sessionsScanned += 1;
     const doc = extractSessionTraceDoc(entry, budget);
@@ -650,10 +625,9 @@ export function runErrorHistorySearch(opts: TraceSearchOptions): ToolResult {
     }
   }
 
-  const scopeNote = skippedExt > 0 ? `${sourceCoverage}; agy-only for trace` : sourceCoverage;
   const coverageBanner = budget.incomplete
-    ? `INCOMPLETE SCAN (${budget.sessionsScanned}/${agyEligible.length} agy sessions, ${(budget.bytesRead / (1024 * 1024)).toFixed(1)} MB; ${budget.reason}; narrow with workspace/sinceDays — do NOT treat 0-match as authoritative).`
-    : `Complete scan: ${budget.sessionsScanned}/${agyEligible.length} agy sessions (${scopeNote}).`;
+    ? `INCOMPLETE SCAN (${budget.sessionsScanned}/${eligible.length} sessions, ${(budget.bytesRead / (1024 * 1024)).toFixed(1)} MB; ${budget.reason}; narrow with workspace/sinceDays — do NOT treat 0-match as authoritative).`
+    : `Complete scan: ${budget.sessionsScanned}/${eligible.length} sessions (${coverageLabel}).`;
 
   if (hits.length === 0) {
     return {

@@ -1,9 +1,9 @@
 {
   "name": "agy-memory",
   "displayName": "agy-memory",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "logo": "assets/logo.svg",
-  "description": "Fast, zero-dependency cross-conversation memory, full-reply search, Swarm board inspection, and persistent note MCP plugin for Antigravity.",
+  "description": "Project Blackboard and Verbatim Session Archive for Google Antigravity (App, CLI, and IDE).",
   "author": {
     "name": "maxLWS",
     "url": "https://github.com/maxLWS"
@@ -12,16 +12,17 @@
   "license": "MIT",
   "keywords": [
     "memory",
+    "blackboard",
+    "projects",
     "history",
     "conversations",
     "search",
     "mcp",
-    "swarm",
-    "productivity"
+    "swarm"
   ],
   "suggestedPrompts": [
-    "List my recent conversations in this workspace",
-    "Search past conversations for decisions about authentication or caching",
-    "Summarize the conclusions from conversation a1b2c3d4"
+    "Read the active project blackboard before starting work",
+    "Search past sessions in this project for file edits or command errors",
+    "Inspect the conclusions from conversation a1b2c3d4"
   ]
 }

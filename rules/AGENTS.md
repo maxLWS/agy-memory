@@ -1,13 +1,8 @@
-# agy-memory Cross-Conversation Memory Rules
+# agy-memory Rules
 
-Use `agy-memory_memory` MCP tools whenever the user references a previous conversation, past file edits or command failures, another CLI session (Codex / Claude Code), or cross-session notes.
+Use `agy-memory_memory` MCP tools directly (include `toolSummary`). Do not grep or run sqlite3 over `~/.gemini/antigravity*`.
 
-1. **Direct invocation & `toolSummary`**: Call `mcp_agy-memory_memory_*` directly with `toolSummary`. Do **not** shell out to `grep`/`python3` over `~/.gemini/antigravity-cli/`, `~/.codex/`, or `~/.claude/` when `agy-memory` can answer it.
-2. **Use `SessionStart` first**: Check `[agy-memory]` at startup (`Current session`, recent sessions, pinned notes) and skip redundant `list_sessions` / `recall_notes` calls when it already answers the question.
-3. **Qualified exclusion & scan coverage**: Pass `excludeSessionId="agy:<id>"` from `SessionStart` when searching past sessions. Trust 0-match negative results **only when scan coverage is complete**—never treat an `INCOMPLETE SCAN` as proof of absence (narrow with `workspace`/`sinceDays`).
-4. **Mode routing & verbatim verification**:
-   - `mode="text"` searches user/assistant replies (hydrated from `transcript_full.jsonl`), Markdown artifacts, and Swarm boards (across `agy`, `codex`, `claude`).
-   - `mode="file_history"` (`agy`) traces verified file writes vs reads from `transcript.jsonl`; `mode="error_history"` (`agy`) traces failed commands, test failures, and non-zero exit codes. **Use `mode="error_history"` for failed commands/tests even when querying a filename.** Never claim a candidate edit fixed an error without verifying the cited `#step` turns.
-   - When `search_sessions`, `read_session(mode="artifacts")`, or `recall_notes` returns a `.md` `Path` >100 lines, read it directly with built-in `read_file(Path)`.
-5. **Cross-CLI scope (`source`)**: Default `source` is `"agy"`. Pass `source: "all"` (or `"codex"` / `"claude"`) when the user mentions Codex or Claude Code, and use qualified IDs (`codex:<id>`, `claude:<id>`) for single-session reads/searches.
-6. **Swarm, large turns, CAS notes & `--cli`**: Use `read_session(mode="swarm")` for Swarm boards, `charOffset` for >8.2 KB turns, and `expectedRevision` from `save_note`/`recall_notes` for safe note updates. Swarm workers without MCP can run `node "<plugin>/dist/mcp-server.mjs" --cli list|search|read ...`.
+1. **Follow the Project Blackboard**: Check `[agy-memory]` startup header (`id`, `scope`, inline entries or key index). If it shows a key index, call `board_read(conversationId="<id>")` before acting on project rules or open handoffs. Current board entries override older transcripts.
+2. **Keep the board current**: Call `board_post(conversationId="<id>", key="<slug>", body="...")` for continuing project rules, accepted decisions, or open handoffs (`scope="global"` for personal cross-project preferences). Pass `expectedRevision` to update a changed decision or set `delete=true` when a handoff finishes. Never store secrets.
+3. **Scoped archive verification**: Pass `conversationId="<id>"` to `search_sessions` (stays inside current project and excludes current session; pass `allScopes=true` only for other projects). Omit `query` to list recent sessions. Use `mode="file_history"` for edits vs reads and `mode="error_history"` for command/test failures even with a filename. Never treat `INCOMPLETE SCAN` 0-matches as absence. Read returned `.md` files >100 lines directly via `read_file`.
+4. **Swarm workers (no MCP)**: Run `node "<plugin>/dist/mcp-server.mjs" --cli board-read|board-post|search|read ...`.

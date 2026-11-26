@@ -1,27 +1,29 @@
-import fs from "node:fs";
-import { resolveClaudeDir, resolveCodexDir } from "./adapters.js";
-import { loadNotes } from "./notes.js";
+import { loadBoardEntries } from "./board.js";
+import {
+  formatScopeKey,
+  inferDataDirFromTranscriptPath,
+  resolveBoardsHome,
+  scopeKeysEqual,
+} from "./scope.js";
 import {
   formatRelativeTime,
-  formatWorkspaceLabel,
-  isTempPath,
-  listSessionArtifactFiles,
-  loadSessionCatalog,
+  loadMultiClientCatalog,
   matchesSessionId,
-  noteWorkspaceMatches,
-  readLastUserPromptSnippet,
-  resolveDataDir,
-  safeSliceChars,
-  truncateUtf8,
-  workspaceMatches,
+  resolveConversationContext,
 } from "./store.js";
-import type { SessionEntry } from "./types.js";
+import type { BoardEntry, ScopeKey } from "./types.js";
+
+export const INLINE_BOARD_BYTE_CAP = 1536;
+export const INDEX_BOARD_BYTE_CAP = 1536;
+const RECENT_SIBLING_WINDOW_MS = 7 * 24 * 3600 * 1000;
 
 export interface SessionStartPayload {
   conversationId?: string;
   conversation_id?: string;
   sessionId?: string;
   session_id?: string;
+  transcriptPath?: string;
+  transcript_path?: string;
   cwd?: string;
   workspacePaths?: string[];
   workspace_paths?: string[];
@@ -29,111 +31,177 @@ export interface SessionStartPayload {
   workspace_roots?: string[];
 }
 
-function firstNonEmptyString(values: unknown): string {
-  if (!Array.isArray(values)) return "";
-  for (const v of values) {
-    const s = String(v ?? "").trim();
-    if (s) return s;
-  }
-  return "";
+export interface SnapshotOptions {
+  overrideDataDir?: string;
+  boardsHome?: string;
+  includeSiblingHint?: boolean;
+  now?: number;
 }
 
-function isTmpPrimaryWorkspace(workspaces: string[]): boolean {
-  if (!Array.isArray(workspaces) || workspaces.length === 0) return false;
-  return isTempPath(workspaces[0] ?? "");
+function collectWorkspacePaths(payload: SessionStartPayload): string[] {
+  const out: string[] = [];
+  const add = (val: unknown) => {
+    if (typeof val === "string" && val.trim() && !out.includes(val.trim())) {
+      out.push(val.trim());
+    }
+  };
+  for (const list of [
+    payload.workspacePaths,
+    payload.workspace_paths,
+    payload.workspaceRoots,
+    payload.workspace_roots,
+  ]) {
+    if (Array.isArray(list)) {
+      for (const item of list) add(item);
+    }
+  }
+  if (out.length === 0) add(payload.cwd);
+  return out;
+}
+
+function renderInlineBoardSection(entries: BoardEntry[], now: number): string {
+  const blocks: string[] = [`Project board (${entries.length} active, inline):`];
+  for (const e of entries) {
+    const scopeTag = e.scope.kind === "global" ? " [global]" : "";
+    const titleTag = e.title && e.title !== e.key ? ` — ${e.title}` : "";
+    const srcTag = e.source?.conversationId
+      ? ` · from ${e.source.conversationId.slice(0, 8)}${e.source.step !== undefined ? `#${e.source.step}` : ""}`
+      : "";
+    blocks.push(
+      `## ${e.key}${scopeTag}${titleTag} (rev=${e.revision} · ${formatRelativeTime(e.updatedAt, now)}${srcTag})\n${e.body}`,
+    );
+  }
+  return blocks.join("\n");
+}
+
+function renderKeyIndexSection(entries: BoardEntry[], fullBytes: number, now: number): string {
+  const header = `Project board (${entries.length} active, ${fullBytes} B > ${INLINE_BOARD_BYTE_CAP} B cap; call board_read for full entries):`;
+  const lines: string[] = [header];
+  let usedBytes = Buffer.byteLength(header, "utf8");
+  let shown = 0;
+
+  for (let i = 0; i < entries.length; i += 1) {
+    const e = entries[i]!;
+    const scopeTag = e.scope.kind === "global" ? " [global]" : "";
+    const titleTag = e.title && e.title !== e.key ? ` — ${e.title}` : "";
+    const srcTag = e.source?.conversationId
+      ? ` · from ${e.source.conversationId.slice(0, 8)}${e.source.step !== undefined ? `#${e.source.step}` : ""}`
+      : "";
+    const line = `- ${e.key}${scopeTag}${titleTag} (${formatRelativeTime(e.updatedAt, now)} · rev=${e.revision}${srcTag})`;
+    const remainingAfter = entries.length - (i + 1);
+    const footerReserve = remainingAfter > 0 ? Buffer.byteLength(`\n(+${remainingAfter} more keys; call board_read)`, "utf8") : 0;
+    const lineBytes = Buffer.byteLength(`\n${line}`, "utf8");
+    if (usedBytes + lineBytes + footerReserve > INDEX_BOARD_BYTE_CAP) {
+      break;
+    }
+    lines.push(line);
+    usedBytes += lineBytes;
+    shown += 1;
+  }
+
+  const omitted = entries.length - shown;
+  if (omitted > 0) {
+    lines.push(`(+${omitted} more keys; call board_read)`);
+  }
+  return lines.join("\n");
+}
+
+export function renderBoardSnapshotSection(
+  scope: ScopeKey,
+  boardsHome = resolveBoardsHome(),
+  now = Date.now(),
+): { text: string; mode: "empty" | "inline" | "index"; entryCount: number; renderedBytes: number } {
+  if (scope.kind === "unresolved") {
+    return { text: "", mode: "empty", entryCount: 0, renderedBytes: 0 };
+  }
+
+  const projectEntries = loadBoardEntries(scope, boardsHome);
+  const globalEntries = scope.kind === "global" ? [] : loadBoardEntries({ kind: "global" }, boardsHome);
+  const entries = [...projectEntries, ...globalEntries];
+
+  if (entries.length === 0) {
+    const text = "Project board: empty.";
+    return { text, mode: "empty", entryCount: 0, renderedBytes: Buffer.byteLength(text, "utf8") };
+  }
+
+  const fullInline = renderInlineBoardSection(entries, now);
+  const fullBytes = Buffer.byteLength(fullInline, "utf8");
+  if (fullBytes <= INLINE_BOARD_BYTE_CAP) {
+    return { text: fullInline, mode: "inline", entryCount: entries.length, renderedBytes: fullBytes };
+  }
+
+  const indexText = renderKeyIndexSection(entries, fullBytes, now);
+  return {
+    text: indexText,
+    mode: "index",
+    entryCount: entries.length,
+    renderedBytes: Buffer.byteLength(indexText, "utf8"),
+  };
 }
 
 export function buildSessionStartSnapshot(
   payload: SessionStartPayload = {},
-  dataDir = resolveDataDir(),
+  opts: SnapshotOptions = {},
 ): string {
   const currentId = String(
-    payload?.conversationId || payload?.conversation_id || payload?.sessionId || payload?.session_id || "",
+    payload.conversationId || payload.conversation_id || payload.sessionId || payload.session_id || "",
   ).trim();
-  const primaryWs =
-    (typeof payload?.cwd === "string" && payload.cwd.trim()) ||
-    firstNonEmptyString(payload?.workspacePaths) ||
-    firstNonEmptyString(payload?.workspace_paths) ||
-    firstNonEmptyString(payload?.workspaceRoots) ||
-    firstNonEmptyString(payload?.workspace_roots) ||
-    "";
-  const isCurrentTmp = isTempPath(primaryWs);
-  const now = Date.now();
+  const transcriptPath = String(payload.transcriptPath || payload.transcript_path || "").trim();
+  const hintDataDir = inferDataDirFromTranscriptPath(transcriptPath);
+  const workspaces = collectWorkspacePaths(payload);
+  const now = opts.now ?? Date.now();
+  const boardsHome = resolveBoardsHome(opts.boardsHome);
+  const includeSiblingHint =
+    opts.includeSiblingHint !== undefined
+      ? opts.includeSiblingHint
+      : process.env.AGY_MEMORY_SIBLING_HINT !== "0";
 
-  const catalog = loadSessionCatalog(dataDir);
-  const eligible = catalog.filter((s) => {
-    if (s.isChild) return false;
-    if (currentId && matchesSessionId(s.sessionId, currentId)) return false;
-    if (primaryWs && !workspaceMatches(s.workspaces, primaryWs)) return false;
-    return s.hasTranscript || Boolean(s.title);
+  const { entries: catalog } = loadMultiClientCatalog(opts.overrideDataDir || "");
+  const ctx = resolveConversationContext({
+    conversationId: currentId,
+    overrideDataDir: opts.overrideDataDir || "",
+    hintDataDir,
+    hintWorkspaces: workspaces,
+    catalog,
   });
 
-  // Prioritize substantive sessions over tiny untitled probes or temp-dir sessions
-  const substantive: SessionEntry[] = [];
-  const minor: SessionEntry[] = [];
-  for (const s of eligible) {
-    const tmpLeak = !isCurrentTmp && isTmpPrimaryWorkspace(s.workspaces);
-    const hasSubstance = !tmpLeak && Boolean(s.title) && (s.stepCount >= 5 || s.hasSwarm);
-    if (hasSubstance) {
-      substantive.push(s);
-    } else if (!tmpLeak) {
-      minor.push(s);
-    }
-  }
-  const recent = [...substantive, ...minor].slice(0, 5);
-
-  // Strictly read-only: SessionStart never writes or triggers legacy JSON migration
-  const notes = loadNotes(dataDir, { readOnly: true })
-    .filter((n) => noteWorkspaceMatches(n.workspace, primaryWs))
-    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
-    .slice(0, 5);
-
-  if (recent.length === 0 && notes.length === 0 && !currentId) {
+  if (!currentId && ctx.scopeKey.kind === "unresolved") {
     return "";
   }
 
-  const lines = ["[agy-memory] Local cross-conversation context (read-only snapshot):"];
-  if (currentId) {
-    const shortCur = currentId.slice(0, 8);
-    lines.push(`Current session: ${shortCur} (pass excludeSessionId="agy:${currentId}" when searching past sessions)`);
+  const scopeLabel = formatScopeKey(ctx.scopeKey);
+  const header = currentId
+    ? `[agy-memory] session=${currentId.slice(0, 8)} (id=${currentId}, scope=${scopeLabel})`
+    : `[agy-memory] scope=${scopeLabel}`;
+
+  if (ctx.scopeKey.kind === "unresolved") {
+    return header;
   }
 
-  if (recent.length > 0) {
-    const wsLabel = primaryWs ? formatWorkspaceLabel(primaryWs) : "";
-    const wsTag = wsLabel ? ` in ${wsLabel}` : "";
-    lines.push(`Recent sessions${wsTag}:`);
-    for (const s of recent) {
-      const snippet = s.hasTranscript
-        ? readLastUserPromptSnippet(s.paths.transcriptPath, 88, { preferSubstantive: true })
-        : "";
-      const artifacts = listSessionArtifactFiles(s.paths.brainDir, { includeMeta: false });
-      const flags: string[] = [];
-      if (s.hasSwarm) flags.push("swarm");
-      if (artifacts.length > 0) flags.push(`${artifacts.length}art`);
-      const badge = flags.length > 0 ? ` [${flags.join(",")}]` : "";
-      const stepPart = s.stepCount > 0 ? `, ${s.stepCount} steps` : "";
-      const title = s.title || "(untitled)";
+  const lines: string[] = [header];
+  const boardSection = renderBoardSnapshotSection(ctx.scopeKey, boardsHome, now);
+  if (boardSection.text) {
+    lines.push(boardSection.text);
+  }
+
+  if (includeSiblingHint) {
+    const recentCutoff = now - RECENT_SIBLING_WINDOW_MS;
+    const siblingIds = new Set<string>();
+    for (const s of catalog) {
+      if (s.isChild) continue;
+      if (currentId && matchesSessionId(s.sessionId, currentId, s.client)) continue;
+      if (!scopeKeysEqual(s.scopeKey, ctx.scopeKey)) continue;
+      if (!s.hasTranscript && !s.title && s.stepCount === 0) continue;
+      if (s.notFullyIdle || s.updatedMs >= recentCutoff) {
+        siblingIds.add(s.sessionId);
+      }
+    }
+    if (siblingIds.size > 0) {
       lines.push(
-        `- ${s.shortId} (${formatRelativeTime(s.updatedMs, now)}${stepPart})${badge} ${title}${snippet ? ` — "${snippet}"` : ""}`,
+        `Activity: ${siblingIds.size} other active or recent session(s) in this scope (call search_sessions with conversationId="${currentId}" if prior context is needed).`,
       );
     }
   }
 
-  if (notes.length > 0) {
-    lines.push("Pinned notes:");
-    for (const n of notes) {
-      const text = String(n.content || "").replace(/\s+/g, " ").trim();
-      const clip = text.length > 140 ? `${safeSliceChars(text, 139)}…` : text;
-      const tagPart = Array.isArray(n.tags) && n.tags.length > 0 ? ` [${n.tags.join(", ")}]` : "";
-      lines.push(`- [${n.id}] ${n.topic}${tagPart}: ${clip}`);
-    }
-  }
-
-  const extAvail: string[] = [];
-  if (fs.existsSync(resolveCodexDir())) extAvail.push("codex");
-  if (fs.existsSync(resolveClaudeDir())) extAvail.push("claude");
-  const extHint = extAvail.length > 0 ? ` Cross-CLI sources: ${extAvail.join(", ")} (source="all").` : "";
-
-  lines.push(`Use agy-memory tools when needed.${extHint}`);
-  return truncateUtf8(lines.join("\n"), 1650, 1800);
+  return lines.join("\n");
 }

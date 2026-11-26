@@ -1,28 +1,33 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import { createRequire } from "node:module";
-import os from "node:os";
 import path from "node:path";
 import {
-  clearAdapterCaches,
-  getExternalSearchableDoc,
-  isExternalDocCached,
-  loadClaudeCatalog,
-  loadCodexCatalog,
-  parseExternalTurns,
-} from "./adapters.js";
+  classifyClientDir,
+  discoverClientDataDirs,
+  formatScopeKey,
+  getBusyTimeoutMs,
+  getNodeSqliteCtor,
+  isTempDirectory,
+  isValidConversationId,
+  normalizeCanonicalPath,
+  PYTHON_INVOCATIONS,
+  readConversationDbMeta,
+  resolveScopeKey,
+  SQLITE_CANDIDATES,
+} from "./scope.js";
 import type {
   ArtifactInfo,
   AssistantResponseRecord,
-  HarnessSource,
+  ClientDataRoot,
+  ClientKind,
   RawSummaryRow,
   ScanBudget,
+  ScopeKey,
   SearchableArtifact,
   SearchableMessage,
   SearchableSessionDoc,
   SessionEntry,
   SessionPaths,
-  SourceFilter,
   SwarmBoardMessage,
   ThoughtRecord,
   ToolCallRecord,
@@ -30,24 +35,6 @@ import type {
   TranscriptTurn,
 } from "./types.js";
 
-const TAIL_PREVIEW_BYTES = 160 * 1024;
-const TAIL_FALLBACK_BYTES = 1024 * 1024;
-const SQLITE_CANDIDATES =
-  process.platform === "win32"
-    ? ["sqlite3", "sqlite3.exe"]
-    : ["sqlite3", "/usr/bin/sqlite3", "/usr/local/bin/sqlite3", "/opt/homebrew/bin/sqlite3"];
-const PYTHON_INVOCATIONS: ReadonlyArray<{ bin: string; prefixArgs: string[] }> =
-  process.platform === "win32"
-    ? [
-        { bin: "python", prefixArgs: [] },
-        { bin: "python3", prefixArgs: [] },
-        { bin: "py", prefixArgs: ["-3"] },
-      ]
-    : [
-        { bin: "python3", prefixArgs: [] },
-        { bin: "/usr/bin/python3", prefixArgs: [] },
-        { bin: "python", prefixArgs: [] },
-      ];
 const TRUNCATION_SUFFIX = "\n… [truncated to fit inline budget]";
 const MAX_TURN_CACHE_ENTRIES = 64;
 const MAX_FULL_CACHE_ENTRIES = 32;
@@ -81,37 +68,11 @@ const turnsCache = new Map<string, TurnsCacheEntry>();
 const fullStepsCache = new Map<string, FullStepsCacheEntry>();
 const searchDocCache = new Map<string, SearchDocCacheEntry>();
 
-interface NodeSqliteStatement {
-  all: () => Array<Record<string, unknown>>;
-}
-
-interface NodeSqliteDatabase {
-  prepare: (sql: string) => NodeSqliteStatement;
-  close: () => void;
-}
-
-type NodeSqliteCtor = new (location: string, options?: { readOnly?: boolean; open?: boolean }) => NodeSqliteDatabase;
-
-let cachedNodeSqliteCtor: NodeSqliteCtor | null | undefined;
-
-function getNodeSqliteCtor(): NodeSqliteCtor | null {
-  if (cachedNodeSqliteCtor !== undefined) return cachedNodeSqliteCtor;
-  try {
-    const req = createRequire(import.meta.url);
-    const mod = req("node:sqlite") as { DatabaseSync?: NodeSqliteCtor };
-    cachedNodeSqliteCtor = typeof mod?.DatabaseSync === "function" ? mod.DatabaseSync : null;
-  } catch {
-    cachedNodeSqliteCtor = null;
-  }
-  return cachedNodeSqliteCtor;
-}
-
 export function clearStoreCaches(): void {
   catalogCache.clear();
   turnsCache.clear();
   fullStepsCache.clear();
   searchDocCache.clear();
-  clearAdapterCaches();
 }
 
 function lruSet<K, V>(map: Map<K, V>, key: K, value: V, maxSize: number): void {
@@ -134,20 +95,8 @@ function statSignature(filePath: string): string {
 }
 
 export function resolveDataDir(overrideDir = ""): string {
-  if (overrideDir && String(overrideDir).trim()) {
-    return path.resolve(String(overrideDir).trim());
-  }
-  const envDir = process.env.AGY_MEMORY_DATA_DIR || process.env.AGY_APP_DATA_DIR || "";
-  if (envDir.trim()) {
-    return path.isAbsolute(envDir.trim())
-      ? envDir.trim()
-      : path.join(os.homedir(), ".gemini", envDir.trim());
-  }
-  const cliDir = path.join(os.homedir(), ".gemini", "antigravity-cli");
-  if (fs.existsSync(cliDir)) return cliDir;
-  const ideDir = path.join(os.homedir(), ".gemini", "antigravity");
-  if (fs.existsSync(ideDir)) return ideDir;
-  return cliDir;
+  const roots = discoverClientDataDirs(overrideDir);
+  return roots[0]!.dataDir;
 }
 
 export function clampMaxChars(
@@ -168,7 +117,6 @@ export function parseAgyTimestamp(raw: unknown): number {
   }
   const text = String(raw ?? "").trim();
   if (!text) return 0;
-  // Normalize Go nanosecond timestamps: "2026-11-24 15:49:05.298126299+00:00"
   const normalized = text
     .replace(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})/, "$1T$2")
     .replace(/(\.\d{3})\d+/, "$1");
@@ -227,11 +175,11 @@ export function truncateUtf8(
 
   const safeMaxChars = Math.max(
     suffixChars + 16,
-    Number.isFinite(Number(maxChars)) ? Math.floor(Number(maxChars)) : 8200,
+    Number.isFinite(Number(maxChars)) ? Math.floor(maxChars) : 8200,
   );
   const safeMaxBytes = Math.max(
     suffixBytes + 16,
-    Number.isFinite(Number(maxBytes)) ? Math.floor(Number(maxBytes)) : 8650,
+    Number.isFinite(Number(maxBytes)) ? Math.floor(maxBytes) : 8650,
   );
 
   if (raw.length <= safeMaxChars && Buffer.byteLength(raw, "utf8") <= safeMaxBytes) {
@@ -256,103 +204,71 @@ export function truncateUtf8(
     }
     out = trimTrailingHighSurrogate(out.slice(0, lo));
   }
-
   return `${out.trimEnd()}${suffix}`;
 }
 
-export function parseQueryTokens(rawQuery: string): string[] {
-  const text = String(rawQuery || "").trim();
+export function parseQueryTokens(query: string): string[] {
+  const text = String(query || "").trim();
   if (!text) return [];
-  const terms: string[] = [];
-  const seen = new Set<string>();
-  const tokenRe = /"([^"]*)"|(\S+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = tokenRe.exec(text)) !== null) {
-    let tok = "";
-    if (match[1] !== undefined) {
-      tok = match[1].trim();
-    } else if (match[2] !== undefined) {
-      tok = match[2].trim();
-      // Ignore standalone quotes like `""`
-      if (/^"+$/.test(tok)) tok = "";
-    }
-    const low = tok.toLowerCase();
-    if (low && !seen.has(low)) {
-      seen.add(low);
-      terms.push(low);
-    }
+  const tokens: string[] = [];
+  const re = /"([^"]+)"|'([^']+)'|(\S+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const tok = (m[1] ?? m[2] ?? m[3] ?? "").trim().toLowerCase();
+    if (tok) tokens.push(tok);
   }
-  return terms;
+  return [...new Set(tokens)];
 }
 
 export function cleanUserRequestText(raw: string): string {
-  if (typeof raw !== "string" || !raw) return "";
-  let text = raw;
-  const openMatch = /<USER_REQUEST>\s*/i.exec(text);
-  if (openMatch) {
-    text = text.slice(openMatch.index + openMatch[0].length);
+  let s = String(raw || "").trim();
+  if (!s) return "";
+  const reqMatch = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i.exec(s);
+  if (reqMatch && reqMatch[1]) {
+    s = reqMatch[1].trim();
   }
-  const closeIdx = text.search(/<\/USER_REQUEST>|<ADDITIONAL_METADATA>|<USER_SETTINGS_CHANGE>/i);
-  if (closeIdx >= 0) {
-    text = text.slice(0, closeIdx);
-  }
-  text = text.replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/gi, "").trim();
-  return text.replace(/\r\n/g, "\n").trim();
+  s = s.replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "").trim();
+  s = s.replace(/<SYSTEM_MESSAGE>[\s\S]*?<\/SYSTEM_MESSAGE>/gi, "").trim();
+  return s;
 }
 
-export function decodeWorkspaceUris(rawJson: string | string[] | null | undefined): string[] {
-  if (!rawJson) return [];
-  let list: unknown[] = [];
-  if (Array.isArray(rawJson)) {
-    list = rawJson;
-  } else {
+export function decodeWorkspaceUris(raw: unknown): string[] {
+  let arr: unknown[] = [];
+  if (Array.isArray(raw)) {
+    arr = raw;
+  } else if (typeof raw === "string" && raw.trim()) {
     try {
-      const parsed = JSON.parse(String(rawJson)) as unknown;
-      if (Array.isArray(parsed)) list = parsed;
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) arr = parsed;
     } catch {
-      return [];
+      arr = [raw];
     }
   }
-  return list
+  return arr
     .map((u) => {
-      const s = String(u ?? "").trim();
-      if (!s) return "";
-      if (s.startsWith("file://")) {
-        let stripped = s.slice("file://".length);
+      if (typeof u !== "string") return "";
+      let p = u.trim();
+      if (p.startsWith("file://")) {
         try {
-          stripped = decodeURIComponent(stripped);
+          p = decodeURIComponent(p.replace(/^file:\/\//i, ""));
+          if (/^\/[a-zA-Z]:\//.test(p)) p = p.slice(1);
         } catch {
-          // Keep raw stripped URI if percent-encoding is malformed
+          p = p.replace(/^file:\/\//i, "");
         }
-        // Normalize Windows file:///C:/Users/... -> C:/Users/...
-        return stripped.replace(/^\/([A-Za-z]:\/)/, "$1");
       }
-      return s;
+      return p;
     })
     .filter(Boolean);
 }
 
 export function normalizeFsPath(rawPath: string): string {
-  const trimmed = String(rawPath || "").trim();
-  const normalized = trimmed
-    .replace(/\\/g, "/")
-    .replace(/^\/([a-zA-Z]:\/)/, "$1")
-    .replace(/\/+$/, "")
-    .toLowerCase();
-  return normalized || (trimmed === "/" ? "/" : "");
+  const canon = normalizeCanonicalPath(rawPath);
+  if (!canon) return "";
+  return process.platform === "win32" || process.platform === "darwin" ? canon.toLowerCase() : canon;
 }
 
 export function isTempPath(rawPath: string): boolean {
-  const norm = normalizeFsPath(rawPath);
-  if (!norm) return false;
-  if (norm === "/tmp" || norm.startsWith("/tmp/") || norm === "/private/tmp" || norm.startsWith("/private/tmp/")) {
-    return true;
-  }
-  const osTmp = normalizeFsPath(os.tmpdir());
-  if (osTmp && (norm === osTmp || norm.startsWith(`${osTmp}/`))) {
-    return true;
-  }
-  return false;
+  return isTempDirectory(rawPath);
 }
 
 export function formatWorkspaceLabel(rawPath: string): string {
@@ -374,27 +290,13 @@ export function workspaceMatches(workspaces: string[], filter: string): boolean 
     if (!norm) return false;
     if (norm === f) return true;
     if (isAbsFilter) {
-      return norm.startsWith(`${f}/`);
+      return norm.startsWith(`${f}/`) || f.startsWith(`${norm}/`);
     }
-    const base = path.posix.basename(norm);
-    return base === f || norm.endsWith(`/${f}`) || norm.includes(`/${f}/`);
+    const lowNorm = norm.toLowerCase();
+    const lowF = f.toLowerCase();
+    const base = path.posix.basename(lowNorm);
+    return base === lowF || lowNorm.endsWith(`/${lowF}`) || lowNorm.includes(`/${lowF}/`);
   });
-}
-
-export function noteWorkspaceMatches(noteWorkspace: string, filterWorkspace: string): boolean {
-  const fw = normalizeFsPath(filterWorkspace);
-  if (!fw) return true;
-  const nw = normalizeFsPath(noteWorkspace);
-  // Global notes (no workspace) always apply
-  if (!nw) return true;
-  if (nw === fw) return true;
-  const isAbsFilter = fw.startsWith("/") || /^[a-z]:\//.test(fw);
-  if (isAbsFilter) {
-    // Note for parent workspace applies in child, and note for child shows when querying parent
-    return nw.startsWith(`${fw}/`) || fw.startsWith(`${nw}/`);
-  }
-  const base = path.posix.basename(nw);
-  return base === fw || nw.endsWith(`/${fw}`) || nw.includes(`/${fw}/`);
 }
 
 export function parseSessionIdList(spec: string | string[] | null | undefined): string[] {
@@ -405,241 +307,119 @@ export function parseSessionIdList(spec: string | string[] | null | undefined): 
     .filter(Boolean);
 }
 
-export const VALID_SOURCES = new Set<SourceFilter>(["agy", "codex", "claude", "all"]);
-
-export function parseSourceFilter(raw: unknown): { source: SourceFilter; error: string | null } {
-  const s = String(raw ?? "agy").trim().toLowerCase() || "agy";
-  if (VALID_SOURCES.has(s as SourceFilter)) {
-    return { source: s as SourceFilter, error: null };
+export function splitClientRef(ref: string): { client: ClientKind | null; id: string } {
+  const trimmed = String(ref || "").trim();
+  const m = /^(app|cli|ide|custom|agy):(.+)$/i.exec(trimmed);
+  if (m && m[1] && m[2]) {
+    const prefix = m[1].toLowerCase();
+    const id = m[2].trim();
+    if (prefix === "agy") return { client: null, id };
+    return { client: prefix as ClientKind, id };
   }
-  return {
-    source: "agy",
-    error: `Error: Invalid source "${String(raw)}". Expected one of: agy, codex, claude, all.`,
-  };
-}
-
-export function splitCanonicalRef(ref: string): { source: HarnessSource | null; id: string } {
-  const clean = String(ref || "").trim();
-  const m = /^(agy|codex|claude):(.+)$/i.exec(clean);
-  if (m) {
-    return { source: m[1]!.toLowerCase() as HarnessSource, id: m[2]!.trim() };
-  }
-  return { source: null, id: clean };
+  return { client: null, id: trimmed };
 }
 
 export function matchesSessionId(
   sessionId: string,
-  filterSpec: string | string[],
-  entrySource: HarnessSource = "agy",
+  spec: string | string[] | null | undefined,
+  sessionClient: ClientKind = "cli",
 ): boolean {
-  const targets = parseSessionIdList(filterSpec);
-  if (targets.length === 0) return false;
-  const sid = String(sessionId || "").trim().toLowerCase();
-  if (!sid) return false;
-  return targets.some((rawTarget) => {
-    const { source: targetSrc, id: targetId } = splitCanonicalRef(rawTarget);
-    if (targetSrc && targetSrc !== entrySource) return false;
-    const tid = targetId.toLowerCase();
-    if (!tid) return false;
-    if (sid === tid) return true;
-    if (tid.length >= 4 && sid.startsWith(tid)) return true;
-    return false;
+  const items = parseSessionIdList(spec);
+  if (items.length === 0) return false;
+  const lowId = String(sessionId || "").toLowerCase();
+  return items.some((rawItem) => {
+    const { client, id } = splitClientRef(rawItem);
+    if (client && client !== sessionClient) return false;
+    const low = id.toLowerCase();
+    if (!low) return false;
+    return lowId === low || (low.length >= 4 && lowId.startsWith(low));
   });
 }
 
-function readTailUtf8(filePath: string, maxBytes: number): { text: string; totalSize: number } {
-  let fd: number | null = null;
-  try {
-    fd = fs.openSync(filePath, "r");
-    const size = fs.fstatSync(fd).size;
-    if (size <= 0) return { text: "", totalSize: 0 };
-    const start = Math.max(0, size - maxBytes);
-    const length = size - start;
-    const buf = Buffer.allocUnsafe(length);
-    fs.readSync(fd, buf, 0, length, start);
-    let text = buf.toString("utf8");
-    if (start > 0) {
-      const nl = text.indexOf("\n");
-      text = nl >= 0 ? text.slice(nl + 1) : "";
-    }
-    return { text, totalSize: size };
-  } catch {
-    return { text: "", totalSize: 0 };
-  } finally {
-    if (fd !== null) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        // Ignore close error
-      }
-    }
-  }
-}
-
-export function getSessionPaths(dataDir: string, sessionId: string): SessionPaths {
-  const brainDir = path.join(dataDir, "brain", sessionId);
+export function getSessionPaths(dataDir: string, conversationId: string): SessionPaths {
+  const brainDir = path.join(dataDir, "brain", conversationId);
   const systemDir = path.join(brainDir, ".system_generated");
-  const logsDir = path.join(systemDir, "logs");
-  const swarmDir = path.join(systemDir, "swarm");
   return {
     brainDir,
     systemDir,
-    transcriptPath: path.join(logsDir, "transcript.jsonl"),
-    transcriptFullPath: path.join(logsDir, "transcript_full.jsonl"),
-    swarmDir,
-    swarmMembersPath: path.join(swarmDir, "members.json"),
-    swarmBoardPath: path.join(swarmDir, "board.jsonl"),
-    swarmPlanPath: path.join(swarmDir, "plan.json"),
+    transcriptPath: path.join(systemDir, "logs", "transcript.jsonl"),
+    transcriptFullPath: path.join(systemDir, "logs", "transcript_full.jsonl"),
+    swarmDir: path.join(systemDir, "swarm"),
+    swarmMembersPath: path.join(systemDir, "swarm", "members.json"),
+    swarmBoardPath: path.join(systemDir, "swarm", "board.jsonl"),
+    swarmPlanPath: path.join(systemDir, "swarm", "plan.json"),
     subagentsDir: path.join(systemDir, "subagents"),
   };
 }
 
 export function listSessionArtifactFiles(
   brainDir: string,
-  { includeMeta = true }: { includeMeta?: boolean } = {},
+  { includeMeta = false }: { includeMeta?: boolean } = {},
 ): ArtifactInfo[] {
+  let entries: string[];
   try {
-    const names = fs
-      .readdirSync(brainDir)
-      .filter((name) => name.endsWith(".md") && !name.startsWith("."))
-      .sort();
-    return names.map((name) => {
-      const filePath = path.join(brainDir, name);
-      let updatedAt = 0;
-      let size = 0;
-      try {
-        const st = fs.statSync(filePath);
-        updatedAt = st.mtimeMs || 0;
-        size = st.size || 0;
-      } catch {
-        // Ignore stat error
-      }
-      let summary = "";
-      if (includeMeta) {
-        const metaPath = `${filePath}.metadata.json`;
-        try {
-          const meta = JSON.parse(fs.readFileSync(metaPath, "utf8")) as {
-            summary?: unknown;
-            Summary?: unknown;
-          };
-          summary = String(meta.summary || meta.Summary || "").trim();
-        } catch {
-          // Optional metadata
-        }
-      }
-      return { name, path: filePath, summary, updatedAt, size };
-    });
+    entries = fs.readdirSync(brainDir);
   } catch {
     return [];
   }
-}
-
-export function isBoilerplatePrompt(text: string): boolean {
-  const clean = String(text || "").replace(/\s+/g, " ").trim();
-  if (!clean) return true;
-  if (/^\/[a-z0-9_-]+(?:\s+\S+)?$/i.test(clean) && clean.length <= 24) return true;
-  if (clean.length <= 12) {
-    const low = clean.toLowerCase();
-    if (
-      /^(ok|okay|yes|no|go|continue|resume|proceed|done|thanks|thx|hi|hello|ping|test|继续|好的|好|行|嗯|收到|开始|确认|ok\s*继续|继续吧|全局安装)[.!。！?？\s]*$/i.test(
-        low,
-      )
-    ) {
-      return true;
-    }
-    if (clean.length <= 5) return true;
-  }
-  return false;
-}
-
-function extractUserPromptFromTailText(
-  tailText: string,
-  preferSubstantive: boolean,
-): { best: string; fallbackLatest: string } {
-  const lines = tailText.split("\n");
-  let fallbackLatest = "";
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const line = (lines[i] ?? "").trim();
-    if (!line || !line.includes('"USER_INPUT"')) continue;
+  const out: ArtifactInfo[] = [];
+  for (const name of entries) {
+    if (!name.endsWith(".md") || name.endsWith(".resolved")) continue;
+    const fullPath = path.join(brainDir, name);
+    let st: fs.Stats;
     try {
-      const step = JSON.parse(line) as { type?: string; content?: string };
-      if (step && step.type === "USER_INPUT") {
-        const cleaned = cleanUserRequestText(step.content || "").replace(/\s+/g, " ").trim();
-        if (!cleaned) continue;
-        if (!fallbackLatest) fallbackLatest = cleaned;
-        if (!preferSubstantive || !isBoilerplatePrompt(cleaned)) {
-          return { best: cleaned, fallbackLatest };
-        }
-      }
+      st = fs.statSync(fullPath);
+      if (!st.isFile()) continue;
     } catch {
-      // Ignore malformed line
+      continue;
     }
-  }
-  return { best: "", fallbackLatest };
-}
-
-export function readLastUserPromptSnippet(
-  transcriptPath: string,
-  maxLen = 140,
-  { preferSubstantive = false }: { preferSubstantive?: boolean } = {},
-): string {
-  // Use warm turns cache if already parsed and still valid
-  const cached = turnsCache.get(transcriptPath);
-  if (cached && cached.sig === statSignature(transcriptPath) && cached.turns.length > 0) {
-    let fallbackLatest = "";
-    for (let i = cached.turns.length - 1; i >= 0; i -= 1) {
-      const turn = cached.turns[i]!;
-      const cleaned = turn.userText.replace(/\s+/g, " ").trim();
-      if (!cleaned) continue;
-      if (!fallbackLatest) fallbackLatest = cleaned;
-      if (!preferSubstantive || !isBoilerplatePrompt(cleaned)) {
-        return cleaned.length > maxLen ? `${safeSliceChars(cleaned, maxLen - 1)}…` : cleaned;
+    let summary = "";
+    let updatedAt = st.mtimeMs;
+    if (includeMeta) {
+      const metaPath = `${fullPath}.metadata.json`;
+      try {
+        const meta = JSON.parse(fs.readFileSync(metaPath, "utf8")) as {
+          summary?: string;
+          updatedAt?: string;
+        };
+        if (meta && typeof meta.summary === "string") summary = meta.summary.trim();
+        if (meta && meta.updatedAt) {
+          const ts = Date.parse(meta.updatedAt);
+          if (!Number.isNaN(ts)) updatedAt = ts;
+        }
+      } catch {
       }
     }
-    if (fallbackLatest) {
-      return fallbackLatest.length > maxLen ? `${safeSliceChars(fallbackLatest, maxLen - 1)}…` : fallbackLatest;
-    }
-    return "";
+    out.push({ name, path: fullPath, summary, updatedAt, size: st.size });
   }
-
-  const first = readTailUtf8(transcriptPath, TAIL_PREVIEW_BYTES);
-  if (!first.text) return "";
-  let { best, fallbackLatest } = extractUserPromptFromTailText(first.text, preferSubstantive);
-
-  if (!best && first.totalSize > TAIL_PREVIEW_BYTES) {
-    const larger = readTailUtf8(transcriptPath, TAIL_FALLBACK_BYTES);
-    if (larger.text) {
-      const second = extractUserPromptFromTailText(larger.text, preferSubstantive);
-      if (second.best) best = second.best;
-      if (!fallbackLatest && second.fallbackLatest) fallbackLatest = second.fallbackLatest;
-    }
-  }
-
-  // If file is larger than 1 MB and still no prompt found in tail (very long tool tail), scan turns once
-  if (!best && !fallbackLatest && first.totalSize > TAIL_FALLBACK_BYTES) {
-    const turns = parseTranscriptTurns(transcriptPath);
-    for (let i = turns.length - 1; i >= 0; i -= 1) {
-      const cleaned = turns[i]!.userText.replace(/\s+/g, " ").trim();
-      if (!cleaned) continue;
-      if (!fallbackLatest) fallbackLatest = cleaned;
-      if (!preferSubstantive || !isBoilerplatePrompt(cleaned)) {
-        best = cleaned;
-        break;
-      }
-    }
-  }
-
-  const chosen = best || fallbackLatest;
-  if (!chosen) return "";
-  return chosen.length > maxLen ? `${safeSliceChars(chosen, maxLen - 1)}…` : chosen;
+  out.sort((a, b) => b.updatedAt - a.updatedAt);
+  return out;
 }
 
-const SUMMARY_SELECT_SQL = [
-  "SELECT conversation_id, title, preview, step_count, last_modified_time,",
-  "workspace_uris, status, parent_conversation_id, nesting_depth, last_user_input_time",
-  "FROM conversation_summaries",
-  "ORDER BY last_modified_time DESC",
-].join(" ");
+function buildDynamicSelectSql(columns: Set<string>): string {
+  const col = (name: string, fallbackExpr: string) =>
+    columns.has(name) ? name : `${fallbackExpr} AS ${name}`;
+  return [
+    "SELECT",
+    [
+      col("conversation_id", "''"),
+      col("title", "''"),
+      col("preview", "''"),
+      col("step_count", "0"),
+      col("last_modified_time", "''"),
+      col("workspace_uris", "'[]'"),
+      col("status", "''"),
+      col("project_id", "''"),
+      col("app_data_dir", "''"),
+      col("not_fully_idle", "0"),
+      col("parent_conversation_id", "''"),
+      col("nesting_depth", "0"),
+      col("last_user_input_time", "''"),
+    ].join(", "),
+    "FROM conversation_summaries",
+    "ORDER BY last_modified_time DESC",
+  ].join(" ");
+}
 
 function mapDbRow(r: Record<string, unknown>): RawSummaryRow {
   return {
@@ -650,40 +430,64 @@ function mapDbRow(r: Record<string, unknown>): RawSummaryRow {
     lastModifiedTime: String(r.last_modified_time ?? ""),
     workspaceUris: typeof r.workspace_uris === "string" ? r.workspace_uris : "[]",
     status: String(r.status ?? ""),
+    projectId: String(r.project_id ?? ""),
+    appDataDir: String(r.app_data_dir ?? ""),
+    notFullyIdle: Boolean(Number(r.not_fully_idle ?? 0) || r.not_fully_idle === true),
     parentConversationId: String(r.parent_conversation_id ?? ""),
     nestingDepth: Number(r.nesting_depth ?? 0),
     lastUserInputTime: String(r.last_user_input_time ?? ""),
   };
 }
 
-function querySummariesViaNodeSqlite(dbPath: string): RawSummaryRow[] | null {
+function querySummariesViaNodeSqlite(dbPath: string, timeoutMs: number): RawSummaryRow[] | null {
   const DatabaseSync = getNodeSqliteCtor();
   if (!DatabaseSync) return null;
-  let db: NodeSqliteDatabase | null = null;
+  let db: ReturnType<typeof Object> & {
+    exec?: (sql: string) => void;
+    prepare: (sql: string) => { all: () => Array<Record<string, unknown>> };
+    close: () => void;
+  } | null = null;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
-    const rows = db.prepare(SUMMARY_SELECT_SQL).all();
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: timeoutMs });
+    if (typeof db.exec === "function") {
+      db.exec(`PRAGMA busy_timeout = ${timeoutMs};`);
+    }
+    const colsRaw = db.prepare("PRAGMA table_info(conversation_summaries)").all();
+    const cols = new Set<string>(colsRaw.map((c: Record<string, unknown>) => String(c.name ?? "")));
+    if (cols.size === 0) return null;
+    const rows = db.prepare(buildDynamicSelectSql(cols)).all();
     return Array.isArray(rows) ? rows.map(mapDbRow) : null;
   } catch {
     return null;
   } finally {
-    if (db) {
-      try {
-        db.close();
-      } catch {
-        // Ignore close error
-      }
+    try {
+      db?.close();
+    } catch {
     }
   }
 }
 
-function querySummariesViaSqliteCli(dbPath: string): RawSummaryRow[] | null {
-  const sql = `${SUMMARY_SELECT_SQL};`;
+function querySummariesViaSqliteCli(dbPath: string, timeoutMs: number): RawSummaryRow[] | null {
   for (const sqliteBin of SQLITE_CANDIDATES) {
     try {
-      const stdout = execFileSync(sqliteBin, ["-readonly", "-json", dbPath, sql], {
+      const colOut = execFileSync(
+        sqliteBin,
+        ["-cmd", `.timeout ${timeoutMs}`, "-readonly", "-json", dbPath, "PRAGMA table_info(conversation_summaries);"],
+        {
+          encoding: "utf8",
+          timeout: Math.max(2500, timeoutMs + 1500),
+          maxBuffer: 1024 * 1024,
+          stdio: ["ignore", "pipe", "ignore"],
+        },
+      );
+      const colRows = JSON.parse(String(colOut || "[]").trim() || "[]") as Array<{ name?: string }>;
+      const cols = new Set(colRows.map((c) => String(c.name ?? "")));
+      if (cols.size === 0) continue;
+
+      const sql = `${buildDynamicSelectSql(cols)};`;
+      const stdout = execFileSync(sqliteBin, ["-cmd", `.timeout ${timeoutMs}`, "-readonly", "-json", dbPath, sql], {
         encoding: "utf8",
-        timeout: 2500,
+        timeout: Math.max(3000, timeoutMs + 2000),
         maxBuffer: 8 * 1024 * 1024,
         stdio: ["ignore", "pipe", "ignore"],
       });
@@ -693,53 +497,50 @@ function querySummariesViaSqliteCli(dbPath: string): RawSummaryRow[] | null {
       if (!Array.isArray(rows)) continue;
       return (rows as Array<Record<string, unknown>>).map(mapDbRow);
     } catch {
-      // Try next candidate
     }
   }
   return null;
 }
 
-function querySummariesViaPython(dbPath: string): RawSummaryRow[] | null {
-  // Use pathlib.Path.as_uri() so read-only SQLite URIs work reliably on Windows, macOS, and Linux
+function querySummariesViaPython(dbPath: string, timeoutMs: number): RawSummaryRow[] | null {
   const pyScript = `
 import json, pathlib, sqlite3, sys
 uri = pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro"
-con = sqlite3.connect(uri, uri=True, timeout=1.0)
-rows = con.execute("""
-  SELECT conversation_id, title, preview, step_count, last_modified_time,
-         workspace_uris, status, parent_conversation_id, nesting_depth,
-         last_user_input_time
-  FROM conversation_summaries
-  ORDER BY last_modified_time DESC
-""").fetchall()
-out = []
-for r in rows:
-  out.append({
-    "conversationId": r[0] or "",
-    "title": r[1] or "",
-    "preview": r[2] or "",
-    "stepCount": int(r[3] or 0),
-    "lastModifiedTime": r[4] or "",
-    "workspaceUris": r[5] or "[]",
-    "status": r[6] or "",
-    "parentConversationId": r[7] or "",
-    "nestingDepth": int(r[8] or 0),
-    "lastUserInputTime": r[9] or "",
-  })
-print(json.dumps(out))
+con = sqlite3.connect(uri, uri=True, timeout=float(sys.argv[2]) / 1000.0)
+try:
+  cols = {r[1] for r in con.execute("PRAGMA table_info(conversation_summaries)").fetchall()}
+  def c(name, fb): return name if name in cols else f"{fb} AS {name}"
+  sql = "SELECT " + ", ".join([
+    c("conversation_id", "''"), c("title", "''"), c("preview", "''"), c("step_count", "0"),
+    c("last_modified_time", "''"), c("workspace_uris", "'[]'"), c("status", "''"),
+    c("project_id", "''"), c("app_data_dir", "''"), c("not_fully_idle", "0"),
+    c("parent_conversation_id", "''"), c("nesting_depth", "0"), c("last_user_input_time", "''")
+  ]) + " FROM conversation_summaries ORDER BY last_modified_time DESC"
+  rows = con.execute(sql).fetchall()
+  out = []
+  for r in rows:
+    out.append({
+      "conversationId": r[0] or "", "title": r[1] or "", "preview": r[2] or "",
+      "stepCount": int(r[3] or 0), "lastModifiedTime": r[4] or "", "workspaceUris": r[5] or "[]",
+      "status": r[6] or "", "projectId": r[7] or "", "appDataDir": r[8] or "",
+      "notFullyIdle": bool(r[9]), "parentConversationId": r[10] or "",
+      "nestingDepth": int(r[11] or 0), "lastUserInputTime": r[12] or ""
+    })
+  print(json.dumps(out))
+finally:
+  con.close()
 `;
   for (const inv of PYTHON_INVOCATIONS) {
     try {
-      const stdout = execFileSync(inv.bin, [...inv.prefixArgs, "-c", pyScript, dbPath], {
+      const stdout = execFileSync(inv.bin, [...inv.prefixArgs, "-c", pyScript, dbPath, String(timeoutMs)], {
         encoding: "utf8",
-        timeout: 3000,
+        timeout: Math.max(3000, timeoutMs + 2000),
         maxBuffer: 8 * 1024 * 1024,
         stdio: ["ignore", "pipe", "ignore"],
       });
       const parsed = JSON.parse(stdout) as unknown;
       if (Array.isArray(parsed)) return parsed as RawSummaryRow[];
     } catch {
-      // Try next candidate
     }
   }
   return null;
@@ -761,7 +562,6 @@ function scanBrainDirsFallback(dataDir: string): RawSummaryRow[] {
       const subFiles = fs.readdirSync(p.subagentsDir).filter((f) => f.endsWith(".json"));
       for (const f of subFiles) childIds.add(f.replace(/\.json$/, ""));
     } catch {
-      // Ignore
     }
     try {
       const members = JSON.parse(fs.readFileSync(p.swarmMembersPath, "utf8")) as {
@@ -773,7 +573,6 @@ function scanBrainDirsFallback(dataDir: string): RawSummaryRow[] {
         }
       }
     } catch {
-      // Ignore
     }
   }
 
@@ -799,6 +598,9 @@ function scanBrainDirsFallback(dataDir: string): RawSummaryRow[] {
       lastModifiedTime: new Date(st.mtimeMs).toISOString(),
       workspaceUris: "[]",
       status: "",
+      projectId: "",
+      appDataDir: path.basename(dataDir),
+      notFullyIdle: false,
       parentConversationId: childIds.has(id) ? "inferred" : "",
       nestingDepth: childIds.has(id) ? 1 : 0,
       lastUserInputTime: "",
@@ -815,12 +617,11 @@ function computeCatalogSignature(dataDir: string): string {
   return `${statSignature(dbPath)}|${statSignature(walPath)}|${statSignature(brainRoot)}`;
 }
 
-export function loadSessionCatalog(dataDir = resolveDataDir()): SessionEntry[] {
-  const resolvedDir = path.resolve(dataDir);
+export function loadSingleRootCatalog(root: ClientDataRoot): SessionEntry[] {
+  const resolvedDir = path.resolve(root.dataDir);
   const sig = computeCatalogSignature(resolvedDir);
   const cached = catalogCache.get(resolvedDir);
   if (cached && cached.sig === sig) {
-    // Re-check transcript/swarm existence only for entries that lacked them previously (cheap O(k))
     for (const entry of cached.entries) {
       if (!entry.hasTranscript && fs.existsSync(entry.paths.transcriptPath)) {
         entry.hasTranscript = true;
@@ -836,25 +637,41 @@ export function loadSessionCatalog(dataDir = resolveDataDir()): SessionEntry[] {
   }
 
   const dbPath = path.join(resolvedDir, "conversation_summaries.db");
+  const timeoutMs = getBusyTimeoutMs();
   let rawRows: RawSummaryRow[] | null = null;
+  let dbReadDegraded = false;
   if (fs.existsSync(dbPath)) {
-    rawRows = querySummariesViaNodeSqlite(dbPath);
+    rawRows = querySummariesViaNodeSqlite(dbPath, timeoutMs);
     if (!Array.isArray(rawRows)) {
-      rawRows = querySummariesViaSqliteCli(dbPath);
+      rawRows = querySummariesViaSqliteCli(dbPath, timeoutMs);
     }
     if (!Array.isArray(rawRows)) {
-      rawRows = querySummariesViaPython(dbPath);
+      rawRows = querySummariesViaPython(dbPath, timeoutMs);
+    }
+    if (!Array.isArray(rawRows)) {
+      dbReadDegraded = true;
     }
   }
   if (!Array.isArray(rawRows)) {
     rawRows = scanBrainDirsFallback(resolvedDir);
   }
 
-  // Also index brain dirs that exist on disk but aren't in summaries DB yet
   const seen = new Set(rawRows.map((r) => r.conversationId));
   const brainRoot = path.join(resolvedDir, "brain");
+  const inferredChildIds = new Set<string>();
   try {
-    for (const id of fs.readdirSync(brainRoot)) {
+    const allBrainIds = fs.readdirSync(brainRoot);
+    for (const id of allBrainIds) {
+      if (id.startsWith(".")) continue;
+      const p = getSessionPaths(resolvedDir, id);
+      try {
+        for (const f of fs.readdirSync(p.subagentsDir)) {
+          if (f.endsWith(".json")) inferredChildIds.add(f.replace(/\.json$/, ""));
+        }
+      } catch {
+      }
+    }
+    for (const id of allBrainIds) {
       if (id.startsWith(".") || seen.has(id)) continue;
       const p = getSessionPaths(resolvedDir, id);
       if (!fs.existsSync(p.transcriptPath)) continue;
@@ -867,13 +684,15 @@ export function loadSessionCatalog(dataDir = resolveDataDir()): SessionEntry[] {
         lastModifiedTime: new Date(st.mtimeMs).toISOString(),
         workspaceUris: "[]",
         status: "",
-        parentConversationId: "",
-        nestingDepth: 0,
+        projectId: "",
+        appDataDir: path.basename(resolvedDir),
+        notFullyIdle: false,
+        parentConversationId: inferredChildIds.has(id) ? "inferred" : "",
+        nestingDepth: inferredChildIds.has(id) ? 1 : 0,
         lastUserInputTime: "",
       });
     }
   } catch {
-    // Ignore
   }
 
   const entries: SessionEntry[] = rawRows
@@ -887,9 +706,12 @@ export function loadSessionCatalog(dataDir = resolveDataDir()): SessionEntry[] {
       const hasTranscript = fs.existsSync(paths.transcriptPath);
       const hasSwarm = fs.existsSync(paths.swarmMembersPath) || fs.existsSync(paths.swarmBoardPath);
       const isChild = Boolean(row.parentConversationId) || (row.nestingDepth || 0) > 0;
+      const client: ClientKind = row.appDataDir ? classifyClientDir(row.appDataDir) : root.client;
+      const scopeKey = resolveScopeKey({ projectId: row.projectId, workspaces });
       return {
-        source: "agy" as const,
-        canonicalId: `agy:${row.conversationId}`,
+        client,
+        dataDir: resolvedDir,
+        canonicalId: `${client}:${row.conversationId}`,
         sessionId: row.conversationId,
         shortId: row.conversationId.slice(0, 8),
         title: String(row.title || "").trim(),
@@ -898,6 +720,9 @@ export function loadSessionCatalog(dataDir = resolveDataDir()): SessionEntry[] {
         updatedMs,
         workspaces,
         status: String(row.status || ""),
+        projectId: String(row.projectId || "").trim(),
+        notFullyIdle: Boolean(row.notFullyIdle),
+        scopeKey,
         isChild,
         parentConversationId: String(row.parentConversationId || ""),
         hasTranscript,
@@ -907,66 +732,200 @@ export function loadSessionCatalog(dataDir = resolveDataDir()): SessionEntry[] {
     })
     .sort((a, b) => b.updatedMs - a.updatedMs);
 
-  catalogCache.set(resolvedDir, { sig, entries });
+  if (!dbReadDegraded) {
+    catalogCache.set(resolvedDir, { sig, entries });
+  }
   return entries;
 }
 
-export function loadFederatedCatalog(
-  dataDir = resolveDataDir(),
-  source: SourceFilter = "agy",
-): { entries: SessionEntry[]; sourceCounts: Record<string, number>; coverageLabel: string } {
-  const sourceCounts: Record<string, number> = {};
-  let entries: SessionEntry[] = [];
+export function loadMultiClientCatalog(overrideDir = ""): {
+  entries: SessionEntry[];
+  clientCounts: Record<string, number>;
+  coverageLabel: string;
+} {
+  const roots = discoverClientDataDirs(overrideDir);
+  const grouped = new Map<string, SessionEntry[]>();
+  const clientCounts: Record<string, number> = {};
 
-  if (source === "agy" || source === "all") {
-    const agy = loadSessionCatalog(dataDir);
-    sourceCounts.agy = agy.length;
-    entries = entries.concat(agy);
-  }
-  if (source === "codex" || source === "all") {
-    const codex = loadCodexCatalog();
-    sourceCounts.codex = codex.length;
-    entries = entries.concat(codex);
-  }
-  if (source === "claude" || source === "all") {
-    const claude = loadClaudeCatalog();
-    sourceCounts.claude = claude.length;
-    entries = entries.concat(claude);
+  for (const root of roots) {
+    const list = loadSingleRootCatalog(root);
+    clientCounts[root.client] = (clientCounts[root.client] || 0) + list.length;
+    for (const entry of list) {
+      const bucket = grouped.get(entry.sessionId);
+      if (bucket) bucket.push(entry);
+      else grouped.set(entry.sessionId, [entry]);
+    }
   }
 
-  if (source === "all") {
-    entries.sort((a, b) => b.updatedMs - a.updatedMs);
+  const merged: SessionEntry[] = [];
+  for (const copies of grouped.values()) {
+    if (copies.length === 1) {
+      merged.push(copies[0]!);
+      continue;
+    }
+    copies.sort((a, b) => {
+      if (b.updatedMs !== a.updatedMs) return b.updatedMs - a.updatedMs;
+      const aScore = (a.hasTranscript ? 2 : 0) + (a.projectId ? 1 : 0);
+      const bScore = (b.hasTranscript ? 2 : 0) + (b.projectId ? 1 : 0);
+      return bScore - aScore;
+    });
+    const newest = copies[0]!;
+    const transcriptBearing = copies.find((c) => c.hasTranscript) || newest;
+    const distinctProjectIds = new Set(copies.map((c) => c.projectId).filter(Boolean));
+    const distinctScopes = new Set(
+      copies.filter((c) => c.scopeKey.kind !== "unresolved").map((c) => formatScopeKey(c.scopeKey)),
+    );
+    const hasConflict = distinctProjectIds.size > 1 || distinctScopes.size > 1;
+    const chosenProjectId = hasConflict ? "" : [...distinctProjectIds][0] || newest.projectId;
+    const chosenWorkspaces = newest.workspaces.length ? newest.workspaces : transcriptBearing.workspaces;
+    const chosenScope: ScopeKey = hasConflict
+      ? { kind: "unresolved", reason: "conflicting project_id across clients" }
+      : resolveScopeKey({ projectId: chosenProjectId, workspaces: chosenWorkspaces });
+
+    merged.push({
+      ...newest,
+      dataDir: transcriptBearing.dataDir,
+      paths: transcriptBearing.paths,
+      hasTranscript: newest.hasTranscript || transcriptBearing.hasTranscript,
+      hasSwarm: newest.hasSwarm || transcriptBearing.hasSwarm,
+      projectId: chosenProjectId,
+      workspaces: chosenWorkspaces,
+      scopeKey: chosenScope,
+    });
   }
 
-  const coverageLabel = Object.entries(sourceCounts)
+  const entries = merged.sort((a, b) => b.updatedMs - a.updatedMs);
+  const coverageLabel = Object.entries(clientCounts)
     .map(([k, v]) => `${k}:${v}`)
     .join(", ");
-  return { entries, sourceCounts, coverageLabel };
+  return { entries, clientCounts, coverageLabel };
+}
+
+export interface ResolvedConversationContext {
+  conversationId: string;
+  client: ClientKind;
+  dataDir: string;
+  projectId: string;
+  workspaces: string[];
+  scopeKey: ScopeKey;
+  diagnostic?: string;
+}
+
+export function resolveConversationContext(opts: {
+  conversationId: string;
+  overrideDataDir?: string;
+  hintDataDir?: string;
+  hintWorkspaces?: string[];
+  catalog?: SessionEntry[];
+}): ResolvedConversationContext {
+  const cid = String(opts.conversationId || "").trim();
+  const hintWorkspaces = (opts.hintWorkspaces || []).filter(Boolean);
+
+  if (!isValidConversationId(cid)) {
+    return {
+      conversationId: cid,
+      client: "cli",
+      dataDir: opts.hintDataDir || resolveDataDir(opts.overrideDataDir),
+      projectId: "",
+      workspaces: hintWorkspaces,
+      scopeKey: { kind: "unresolved", reason: "invalid conversationId" },
+      diagnostic: "Invalid conversationId format.",
+    };
+  }
+
+  const catalog = opts.catalog || loadMultiClientCatalog(opts.overrideDataDir).entries;
+  const summaryEntry = catalog.find((e) => e.sessionId === cid) || null;
+  if (summaryEntry && summaryEntry.scopeKey.kind === "unresolved" && summaryEntry.scopeKey.reason?.includes("conflicting")) {
+    return {
+      conversationId: cid,
+      client: summaryEntry.client,
+      dataDir: summaryEntry.dataDir,
+      projectId: "",
+      workspaces: summaryEntry.workspaces,
+      scopeKey: summaryEntry.scopeKey,
+      diagnostic: summaryEntry.scopeKey.reason,
+    };
+  }
+
+  const roots = discoverClientDataDirs(opts.overrideDataDir);
+  const candidateDirs: string[] = [];
+  if (opts.hintDataDir) candidateDirs.push(path.resolve(opts.hintDataDir));
+  if (summaryEntry?.dataDir && !candidateDirs.includes(summaryEntry.dataDir)) {
+    candidateDirs.push(summaryEntry.dataDir);
+  }
+  for (const r of roots) {
+    if (!candidateDirs.includes(r.dataDir)) candidateDirs.push(r.dataDir);
+  }
+
+  const observedProjectIds = new Set<string>();
+  if (summaryEntry?.projectId) observedProjectIds.add(summaryEntry.projectId);
+  let protoWorkspaces: string[] = [];
+  let protoDataDir = "";
+
+  for (const dir of candidateDirs) {
+    const res = readConversationDbMeta(dir, cid);
+    if (res.projectId) {
+      observedProjectIds.add(res.projectId);
+      if (!protoDataDir) protoDataDir = dir;
+    }
+    if (protoWorkspaces.length === 0 && res.workspaces.length > 0) {
+      protoWorkspaces = res.workspaces;
+    }
+  }
+
+  if (observedProjectIds.size > 1) {
+    return {
+      conversationId: cid,
+      client: summaryEntry?.client || classifyClientDir(protoDataDir || candidateDirs[0] || ""),
+      dataDir: summaryEntry?.dataDir || protoDataDir || candidateDirs[0] || "",
+      projectId: "",
+      workspaces: summaryEntry?.workspaces.length ? summaryEntry.workspaces : protoWorkspaces.length ? protoWorkspaces : hintWorkspaces,
+      scopeKey: { kind: "unresolved", reason: "conflicting project_id" },
+      diagnostic: `Conflicting project_id values observed for ${cid}: ${[...observedProjectIds].join(", ")}.`,
+    };
+  }
+
+  const effectiveProjectId = [...observedProjectIds][0] || "";
+  const effectiveDataDir = summaryEntry?.dataDir || protoDataDir || candidateDirs[0] || resolveDataDir(opts.overrideDataDir);
+  const effectiveClient = summaryEntry?.client || classifyClientDir(effectiveDataDir);
+  const effectiveWorkspaces = summaryEntry?.workspaces.length
+    ? summaryEntry.workspaces
+    : protoWorkspaces.length
+      ? protoWorkspaces
+      : hintWorkspaces;
+  const scopeKey = resolveScopeKey({
+    projectId: effectiveProjectId,
+    workspaces: effectiveWorkspaces,
+  });
+
+  return {
+    conversationId: cid,
+    client: effectiveClient,
+    dataDir: effectiveDataDir,
+    projectId: effectiveProjectId,
+    workspaces: effectiveWorkspaces,
+    scopeKey,
+  };
 }
 
 export function resolveSessionEntry(
-  dataDir: string,
+  overrideDir: string,
   sessionRef: string,
   catalog: SessionEntry[] | null = null,
-  sourceFilter: SourceFilter = "agy",
 ): { entry: SessionEntry | null; error: string | null } {
   const rawRef = String(sessionRef || "").trim();
   if (!rawRef) return { entry: null, error: "sessionId is required." };
 
-  const { source: explicitSource, id: bareRef } = splitCanonicalRef(rawRef);
+  const { client: explicitClient, id: bareRef } = splitClientRef(rawRef);
   const ref = bareRef.toLowerCase();
-  const effectiveSource: SourceFilter = explicitSource || sourceFilter;
-  const list = catalog || loadFederatedCatalog(dataDir, effectiveSource).entries;
-  const scoped = explicitSource ? list.filter((s) => s.source === explicitSource) : list;
+  const list = catalog || loadMultiClientCatalog(overrideDir).entries;
+  const scoped = explicitClient ? list.filter((s) => s.client === explicitClient) : list;
 
   const exactMatches = scoped.filter((s) => s.sessionId.toLowerCase() === ref);
   if (exactMatches.length === 1) return { entry: exactMatches[0]!, error: null };
   if (exactMatches.length > 1) {
     const listStr = exactMatches.map((m) => `${m.canonicalId} (${m.title || "untitled"})`).join(", ");
-    return {
-      entry: null,
-      error: `Ambiguous session ID "${sessionRef}" across harnesses; qualify with source prefix: ${listStr}`,
-    };
+    return { entry: null, error: `Ambiguous session ID "${sessionRef}"; qualify with client prefix: ${listStr}` };
   }
   if (ref.length < 4) {
     return { entry: null, error: `Session prefix "${sessionRef}" is too short (use at least 4 characters).` };
@@ -976,11 +935,11 @@ export function resolveSessionEntry(
   if (matches.length > 1) {
     const listStr = matches
       .slice(0, 5)
-      .map((m) => `${m.source === "agy" && effectiveSource === "agy" ? m.shortId : `${m.source}:${m.shortId}`} (${m.title || "untitled"})`)
+      .map((m) => `${m.shortId} (${m.title || "untitled"})`)
       .join(", ");
     return { entry: null, error: `Ambiguous session prefix "${sessionRef}"; matches: ${listStr}` };
   }
-  return { entry: null, error: `No local conversation found matching "${sessionRef}" (source=${effectiveSource}).` };
+  return { entry: null, error: `No local conversation found matching "${sessionRef}".` };
 }
 
 function loadFullTranscriptStepMap(transcriptFullPath: string): Map<number, string> | null {
@@ -1002,7 +961,6 @@ function loadFullTranscriptStepMap(transcriptFullPath: string): Map<number, stri
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    // Fast pre-filter skips ~95% of GENERIC tool output lines before JSON.parse
     if (!trimmed.includes('"USER_INPUT"') && !trimmed.includes('"PLANNER_RESPONSE"')) continue;
     let step: { step_index?: unknown; type?: string; content?: unknown };
     try {
@@ -1081,7 +1039,6 @@ export function parseTranscriptTurns(
     for (const line of raw.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      // Fast pre-filter: skips ~97% of raw lines (GENERIC tool responses / checkpoints)
       if (!trimmed.includes('"USER_INPUT"') && !trimmed.includes('"PLANNER_RESPONSE"')) continue;
       let step: Record<string, unknown>;
       try {
@@ -1213,7 +1170,6 @@ export function parseSwarmBoardMessages(swarmBoardPath: string): SwarmBoardMessa
         text: String(msg.text ?? "").trim(),
       });
     } catch {
-      // Skip malformed line
     }
   }
   return messages;
@@ -1245,9 +1201,6 @@ export function getSearchableSessionDoc(
   entry: SessionEntry,
   { includeFullTranscript = true, budget }: { includeFullTranscript?: boolean; budget?: ScanBudget } = {},
 ): SearchableSessionDoc {
-  if (entry.source !== "agy") {
-    return getExternalSearchableDoc(entry, budget);
-  }
   const cacheKey = entry.canonicalId;
   const transcriptSig = entry.hasTranscript ? statSignature(entry.paths.transcriptPath) : "none";
   const fullSig =
@@ -1329,7 +1282,6 @@ export function getSearchableSessionDoc(
         lowCombined: combined.toLowerCase(),
       });
     } catch {
-      // Ignore unreadable artifact
     }
   }
 
@@ -1353,7 +1305,6 @@ export function getSearchableSessionDoc(
 }
 
 export function isSessionDocCached(entry: SessionEntry): boolean {
-  if (entry.source !== "agy") return isExternalDocCached(entry);
   return searchDocCache.has(entry.canonicalId);
 }
 
@@ -1367,123 +1318,6 @@ function summarizeToolCounts(tools: ToolCallRecord[], maxDistinct = 4): string {
   const shown = sorted.slice(0, maxDistinct).map(([name, count]) => (count > 1 ? `${name}×${count}` : name));
   const extra = sorted.length > maxDistinct ? `, +${sorted.length - maxDistinct} more` : "";
   return `${shown.join(", ")}${extra}`;
-}
-
-export interface ListSessionsOptions {
-  dataDir?: string;
-  source?: string;
-  workspace?: string;
-  query?: string;
-  includeChildren?: boolean;
-  excludeSessionId?: string;
-  sinceHours?: number;
-  minSteps?: number;
-  limit?: number;
-  maxChars?: number;
-}
-
-export function listSessionsResult(opts: ListSessionsOptions = {}): ToolResult {
-  const {
-    dataDir = resolveDataDir(),
-    source = "agy",
-    workspace = "",
-    query = "",
-    includeChildren = false,
-    excludeSessionId = "",
-    sinceHours = 0,
-    minSteps = 0,
-    limit = 15,
-    maxChars = 8200,
-  } = opts;
-
-  const parsedSource = parseSourceFilter(source);
-  if (parsedSource.error) {
-    return { text: parsedSource.error, isError: true };
-  }
-  const safeSource = parsedSource.source;
-  const safeLimit = Math.max(1, Math.min(50, Number(limit) || 15));
-  const safeMaxChars = clampMaxChars(maxChars, 8200);
-  const safeMinSteps = Math.max(0, Number(minSteps) || 0);
-  const { entries: catalog, coverageLabel } = loadFederatedCatalog(dataDir, safeSource);
-  const now = Date.now();
-  const minMs = sinceHours > 0 ? now - sinceHours * 3600 * 1000 : 0;
-  const queryTerms = parseQueryTokens(query);
-
-  const filtered: Array<SessionEntry & { lastPrompt: string }> = [];
-  for (const s of catalog) {
-    if (!includeChildren && s.isChild) continue;
-    if (excludeSessionId && matchesSessionId(s.sessionId, excludeSessionId, s.source)) continue;
-    if (minMs > 0 && s.updatedMs < minMs) continue;
-    if (safeMinSteps > 0 && s.stepCount < safeMinSteps) continue;
-    if (!workspaceMatches(s.workspaces, workspace)) continue;
-
-    let lastPrompt = "";
-    if (queryTerms.length > 0) {
-      const baseHay = `${s.source} ${s.title} ${s.preview} ${s.sessionId} ${s.workspaces.join(" ")}`.toLowerCase();
-      let matched = queryTerms.every((t) => baseHay.includes(t));
-      if (!matched && s.hasTranscript && s.source === "agy") {
-        lastPrompt = readLastUserPromptSnippet(s.paths.transcriptPath, 160, { preferSubstantive: true });
-        const extHay = `${baseHay} ${lastPrompt.toLowerCase()}`;
-        matched = queryTerms.every((t) => extHay.includes(t));
-      }
-      if (!matched) continue;
-    }
-
-    filtered.push({ ...s, lastPrompt });
-    if (filtered.length >= safeLimit) break;
-  }
-
-  if (filtered.length === 0) {
-    return {
-      text: `No matching conversations found (sources: ${coverageLabel}${workspace ? `, workspace~"${workspace}"` : ""}).`,
-      isError: false,
-    };
-  }
-
-  const lines = [
-    `Recent conversations (${filtered.length} shown; sources: ${coverageLabel}${workspace ? `, workspace~"${workspace}"` : ""}${safeMinSteps > 0 ? `, minSteps>=${safeMinSteps}` : ""}):`,
-    "",
-  ];
-  for (const s of filtered) {
-    const snippet =
-      s.lastPrompt ||
-      (s.hasTranscript && s.source === "agy"
-        ? readLastUserPromptSnippet(s.paths.transcriptPath, 120, { preferSubstantive: true })
-        : s.preview && s.preview !== s.title
-          ? s.preview
-          : "");
-    const artifacts = s.source === "agy" ? listSessionArtifactFiles(s.paths.brainDir, { includeMeta: false }) : [];
-    const wsName = s.workspaces.length > 0 ? (s.workspaces[0] ?? "") : "";
-    const wsLabel = wsName ? formatWorkspaceLabel(wsName) : "";
-    const badges: string[] = [];
-    if (s.source !== "agy" || safeSource === "all") badges.push(s.source);
-    if (s.hasSwarm) badges.push("swarm");
-    if (artifacts.length > 0) badges.push(`${artifacts.length} artifacts`);
-    if (s.isChild) badges.push("child");
-    const badgeStr = badges.length > 0 ? ` [${badges.join(", ")}]` : "";
-    const title = s.title || "(untitled)";
-    const meta = [
-      formatShortDate(s.updatedMs),
-      formatRelativeTime(s.updatedMs, now),
-      wsLabel,
-      s.stepCount > 0 ? `${s.stepCount} steps` : "",
-    ]
-      .filter(Boolean)
-      .join(" · ");
-    const dispId = s.source === "agy" ? s.shortId : `${s.source}:${s.shortId}`;
-    const fullId = s.source === "agy" ? s.sessionId : s.canonicalId;
-    lines.push(`- **${dispId}** (${fullId}) — ${title}${badgeStr}`);
-    lines.push(`  ${meta}`);
-    if (snippet) {
-      lines.push(`  Last user: ${snippet}`);
-    }
-  }
-
-  return { text: truncateUtf8(lines.join("\n"), safeMaxChars), isError: false };
-}
-
-export function listSessionsFormatted(opts: ListSessionsOptions = {}): string {
-  return listSessionsResult(opts).text;
 }
 
 function formatSwarmMode(
@@ -1526,7 +1360,6 @@ function formatSwarmMode(
       membersLoaded = true;
     }
   } catch {
-    // Optional members.json
   }
 
   const allMessages = parseSwarmBoardMessages(entry.paths.swarmBoardPath);
@@ -1571,19 +1404,33 @@ function formatSwarmMode(
   const forwardFromStart = hasStartSeq && !hasEndSeq;
   const candidateSlice = forwardFromStart ? matched.slice(0, limitMsgs) : matched.slice(-limitMsgs);
 
-  // Dynamic body clip: generous when viewing few targeted messages, tighter when scanning many
-  const bodyClipLen = candidateSlice.length <= 4 ? 1400 : candidateSlice.length <= 12 ? 520 : 320;
-
-  const formatMsgBlock = (msg: SwarmBoardMessage): string => {
-    const body = msg.text;
-    const clipped = body.length > bodyClipLen ? `${safeSliceChars(body, bodyClipLen - 1)}…` : body;
-    return `\n[#${msg.seq} ${msg.time || ""} · ${msg.agent}${msg.kind ? ` (${msg.kind})` : ""}]\n${clipped}`;
-  };
-
-  const reserveForSummaryAndFooter = 240;
+  const reserveForSummaryAndFooter = 280;
   const headerText = headerLines.join("\n");
   const maxBodyChars = Math.max(400, safeMaxChars - headerText.length - reserveForSummaryAndFooter);
   const maxBodyBytes = Math.max(400, 8650 - Buffer.byteLength(headerText, "utf8") - reserveForSummaryAndFooter);
+
+  const bodyClipLen =
+    candidateSlice.length === 1
+      ? maxBodyChars
+      : candidateSlice.length <= 4
+        ? Math.max(1600, Math.floor((maxBodyChars - candidateSlice.length * 90) / candidateSlice.length))
+        : candidateSlice.length <= 12
+          ? 900
+          : 480;
+
+  const formatMsgBlock = (msg: SwarmBoardMessage): string => {
+    const body = msg.text;
+    const msgHeader = `\n[#${msg.seq} ${msg.time || ""} · ${msg.agent}${msg.kind ? ` (${msg.kind})` : ""}]\n`;
+    const effectiveClip = Math.max(200, bodyClipLen - msgHeader.length);
+    if (body.length <= effectiveClip) {
+      return `${msgHeader}${body}`;
+    }
+    const hint =
+      candidateSlice.length === 1
+        ? `… [clipped at ${effectiveClip}/${body.length} chars; full board: ${entry.paths.swarmBoardPath}]`
+        : `… [clipped at ${effectiveClip}/${body.length} chars; pass startSeq=${msg.seq} endSeq=${msg.seq} for full message]`;
+    return `${msgHeader}${safeSliceChars(body, Math.max(120, effectiveClip - hint.length))}${hint}`;
+  };
 
   const chosen: Array<{ msg: SwarmBoardMessage; block: string }> = [];
   let usedChars = 0;
@@ -1601,7 +1448,6 @@ function formatSwarmMode(
       usedBytes += bBytes;
     }
   } else {
-    // Pack from NEWEST backwards so newest messages are NEVER chopped off by truncation
     for (let i = candidateSlice.length - 1; i >= 0; i -= 1) {
       const msg = candidateSlice[i]!;
       const block = formatMsgBlock(msg);
@@ -1665,16 +1511,14 @@ function formatArtifactsMode(
     for (const a of artifacts) {
       let lineCount = 0;
       try {
-        const content = fs.readFileSync(a.path, "utf8");
-        lineCount = splitFileLines(content).length;
+        lineCount = splitFileLines(fs.readFileSync(a.path, "utf8")).length;
       } catch {
-        // Ignore
       }
       out.push(`- ${a.name} (${lineCount} lines, ${a.size} B) — Path: ${a.path}`);
       if (a.summary) out.push(`  ${(a.summary.split("\n")[0] ?? "").slice(0, 180)}`);
     }
     out.push(
-      "\nTip: For full reads of large Markdown artifacts (>100 lines), call built-in read_file(Path) directly (46 KB inline) or pass artifactName + startLine/endLine.",
+      "\nTip: For full reads of large Markdown artifacts (>100 lines), call built-in read_file(Path) directly or pass artifactName + startLine/endLine.",
     );
     return { text: truncateUtf8(out.join("\n"), safeMaxChars), isError: false };
   }
@@ -1706,7 +1550,6 @@ function formatArtifactsMode(
       : sLine + 179;
   const eLine = Math.min(totalLines, Math.max(sLine, requestedEnd));
 
-  // Pack lines within char/byte budget so header reports exact line range actually shown
   const headerReserve = 280 + target.path.length;
   const maxBodyChars = Math.max(200, safeMaxChars - headerReserve);
   const maxBodyBytes = Math.max(200, 8650 - headerReserve);
@@ -1744,7 +1587,6 @@ function formatArtifactsMode(
 
 export interface ReadSessionOptions {
   dataDir?: string;
-  source?: string;
   sessionId?: string;
   mode?: string;
   startStep?: number | null;
@@ -1765,8 +1607,7 @@ export interface ReadSessionOptions {
 
 export function readSessionResult(opts: ReadSessionOptions = {}): ToolResult {
   const {
-    dataDir = resolveDataDir(),
-    source = "agy",
+    dataDir = "",
     sessionId = "",
     mode = "digest",
     startStep = null,
@@ -1785,11 +1626,6 @@ export function readSessionResult(opts: ReadSessionOptions = {}): ToolResult {
     maxChars = 8200,
   } = opts;
 
-  const parsedSource = parseSourceFilter(source);
-  if (parsedSource.error) {
-    return { text: parsedSource.error, isError: true };
-  }
-
   const safeMode = String(mode || "digest").trim().toLowerCase();
   if (!VALID_READ_MODES.has(safeMode)) {
     return {
@@ -1799,13 +1635,12 @@ export function readSessionResult(opts: ReadSessionOptions = {}): ToolResult {
   }
 
   const safeMaxChars = clampMaxChars(maxChars, 8200);
-  const { entry, error } = resolveSessionEntry(dataDir, sessionId, null, parsedSource.source);
+  const { entry, error } = resolveSessionEntry(dataDir, sessionId, null);
   if (error || !entry) {
     return { text: `Error: ${error || "Session not found."}`, isError: true };
   }
 
-  const artifacts =
-    entry.source === "agy" ? listSessionArtifactFiles(entry.paths.brainDir, { includeMeta: safeMode === "artifacts" }) : [];
+  const artifacts = listSessionArtifactFiles(entry.paths.brainDir, { includeMeta: safeMode === "artifacts" });
   const wsStr = entry.workspaces.join(", ") || "(unknown)";
 
   if (safeMode === "artifacts") {
@@ -1816,16 +1651,13 @@ export function readSessionResult(opts: ReadSessionOptions = {}): ToolResult {
     return formatSwarmMode(entry, { tailMessages, startSeq, endSeq, query, safeMaxChars });
   }
 
-  const turns =
-    entry.source === "agy"
-      ? parseTranscriptTurns(entry.paths.transcriptPath, {
-          hydrateFull: safeMode === "turns",
-          transcriptFullPath: entry.paths.transcriptFullPath,
-        })
-      : parseExternalTurns(entry);
+  const turns = parseTranscriptTurns(entry.paths.transcriptPath, {
+    hydrateFull: safeMode === "turns",
+    transcriptFullPath: entry.paths.transcriptFullPath,
+  });
   if (turns.length === 0) {
     return {
-      text: `Session ${entry.source === "agy" ? entry.shortId : entry.canonicalId} (${entry.title || "untitled"}) has no readable transcript turns yet.`,
+      text: `Session ${entry.shortId} (${entry.title || "untitled"}) has no readable transcript turns yet.`,
       isError: false,
     };
   }
@@ -1833,7 +1665,7 @@ export function readSessionResult(opts: ReadSessionOptions = {}): ToolResult {
   const firstStep = turns[0]!.startStep;
   const lastStep = turns[turns.length - 1]!.endStep;
   const headerLines = [
-    `Session: ${entry.source === "agy" ? entry.sessionId : entry.canonicalId} (source=${entry.source})`,
+    `Session: ${entry.sessionId} (client=${entry.client}, scope=${formatScopeKey(entry.scopeKey)})`,
     `Title: ${entry.title || "(untitled)"}`,
     `Workspace: ${wsStr}`,
     `Updated: ${formatShortDate(entry.updatedMs)} (${formatRelativeTime(entry.updatedMs)}) · Turns: ${turns.length} · Steps: #${firstStep}-#${lastStep} (${entry.stepCount || lastStep + 1} total)`,
@@ -1898,7 +1730,6 @@ export function readSessionResult(opts: ReadSessionOptions = {}): ToolResult {
       for (let i = 0; i < headCount; i += 1) pickedIndices.add(i);
       for (let i = turns.length - tailCount; i < turns.length; i += 1) pickedIndices.add(i);
 
-      // Estimate current char/byte budget and sample high-signal middle milestones into unused space
       const baseText = [
         ...out,
         ...[...pickedIndices].sort((a, b) => a - b).map((idx) => formatDigestTurn(turns[idx]!)),
@@ -1910,10 +1741,9 @@ export function readSessionResult(opts: ReadSessionOptions = {}): ToolResult {
         const middleCandidates: Array<{ idx: number; signal: number; rendered: string }> = [];
         for (let i = headCount; i < turns.length - tailCount; i += 1) {
           const t = turns[i]!;
-          const substantiveUser = t.userText && !isBoilerplatePrompt(t.userText) ? 20 : 0;
           const replySignal = Math.min(40, Math.floor(t.finalAssistantText.length / 40));
           const toolSignal = Math.min(30, t.tools.length * 3);
-          const signal = substantiveUser + replySignal + toolSignal;
+          const signal = (t.userText ? 15 : 0) + replySignal + toolSignal;
           if (signal > 0) {
             middleCandidates.push({ idx: i, signal, rendered: formatDigestTurn(t) });
           }
@@ -1946,15 +1776,13 @@ export function readSessionResult(opts: ReadSessionOptions = {}): ToolResult {
         out.push(formatDigestTurn(turns[idx]!));
         prevIdx = idx;
       }
-      const tipId = entry.source === "agy" ? entry.shortId : `${entry.source}:${entry.shortId}`;
       out.push(
-        `\nTip: use search_sessions(sessionId="${tipId}", query="...") to jump to specific topics, or read_session(sessionId="${tipId}", mode="turns", startStep=..., endStep=...).`,
+        `\nTip: use search_sessions(sessionId="${entry.shortId}", query="...") to jump to specific topics, or read_session(sessionId="${entry.shortId}", mode="turns", startStep=..., endStep=...).`,
       );
     }
     return { text: truncateUtf8(out.join("\n"), safeMaxChars), isError: false };
   }
 
-  // mode === "turns"
   let selected = turns;
   const hasStartStep = typeof startStep === "number" && Number.isFinite(startStep);
   const hasEndStep = typeof endStep === "number" && Number.isFinite(endStep);
@@ -2014,7 +1842,6 @@ export function readSessionResult(opts: ReadSessionOptions = {}): ToolResult {
     return { text: combined, isError: false };
   }
 
-  // Compute exact next charOffset for seamless pagination across >8.6 KB hydrated turns
   const footerPlaceholder = `\n… [truncated; pass charOffset=${safeOffset + safeMaxChars} (of ${fullBody.length}) to read more]`;
   const maxContentChars = Math.max(200, safeMaxChars - headerBlock.length - 1 - footerPlaceholder.length - 12);
   const maxContentBytes = Math.max(

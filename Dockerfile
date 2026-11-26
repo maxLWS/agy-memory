@@ -3,7 +3,7 @@
 FROM node:22-alpine
 
 LABEL org.opencontainers.image.title="agy-memory MCP Server" \
-      org.opencontainers.image.description="Local, zero-dependency cross-conversation memory MCP plugin for Google Antigravity (agy)." \
+      org.opencontainers.image.description="Per-project Markdown blackboard and local session archive MCP plugin for Google Antigravity." \
       org.opencontainers.image.source="https://github.com/maxLWS/agy-memory" \
       org.opencontainers.image.licenses="MIT"
 

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import { checkScanBudget, createScanBudget } from "./adapters.js";
+import { formatScopeKey, parseExplicitScopeKey, scopeKeysEqual } from "./scope.js";
 import {
   clampMaxChars,
   formatRelativeTime,
@@ -9,20 +9,19 @@ import {
   getSearchableSessionDoc,
   isSessionDocCached,
   listSessionArtifactFiles,
-  loadFederatedCatalog,
+  loadMultiClientCatalog,
   matchesSessionId,
   normalizeFsPath,
   parseQueryTokens,
-  parseSourceFilter,
-  resolveDataDir,
+  resolveConversationContext,
   resolveSessionEntry,
   safeSliceChars,
-  splitCanonicalRef,
   truncateUtf8,
   workspaceMatches,
 } from "./store.js";
+import { checkScanBudget, createScanBudget } from "./stream.js";
 import { runErrorHistorySearch, runFileHistorySearch } from "./trace.js";
-import type { ScanBudget, SessionEntry, SourceFilter, ToolResult } from "./types.js";
+import type { ScanBudget, ScopeKey, SessionEntry, ToolResult } from "./types.js";
 
 const RG_CANDIDATES =
   process.platform === "win32"
@@ -68,7 +67,7 @@ interface SessionSearchHit {
 
 function parseSearchQuery(rawQuery: string, isRegex: boolean): ParsedQuery {
   const text = String(rawQuery || "").trim();
-  if (!text) return { terms: [], regex: null, error: "Error: query is required." };
+  if (!text) return { terms: [], regex: null, error: null };
   if (isRegex) {
     try {
       return { terms: [text], regex: new RegExp(text, "i"), error: null };
@@ -82,9 +81,6 @@ function parseSearchQuery(rawQuery: string, isRegex: boolean): ParsedQuery {
     }
   }
   const terms = parseQueryTokens(text);
-  if (terms.length === 0) {
-    return { terms: [], regex: null, error: "Error: query is required." };
-  }
   return { terms, regex: null, error: null };
 }
 
@@ -112,7 +108,6 @@ function buildCenteredSnippet(text: string, terms: string[], regex: RegExp | nul
   const prefix = start > 0 ? "…" : "";
   const suffix = end < clean.length ? "…" : "";
   let slice = clean.slice(start, end);
-  // Avoid leading low surrogate if start landed mid-pair
   if (slice.length > 0) {
     const firstCode = slice.charCodeAt(0);
     if (firstCode >= 0xdc00 && firstCode <= 0xdfff) {
@@ -129,7 +124,6 @@ function rankSeedTerms(terms: string[]): string[] {
       const cjkMatches = term.match(CJK_CHAR_RE);
       const cjkCount = cjkMatches ? cjkMatches.length : 0;
       const nonCjkLen = term.length - cjkCount;
-      // CJK characters carry higher selectivity than generic English words
       return cjkCount * 3.5 + nonCjkLen;
     };
     return scoreOf(b) - scoreOf(a);
@@ -158,7 +152,7 @@ function collectEligibleRgFiles(
         registerFile(entry.paths.transcriptFullPath, entry.canonicalId);
       }
     }
-    if (wantArtifacts && entry.source === "agy") {
+    if (wantArtifacts) {
       const arts = listSessionArtifactFiles(entry.paths.brainDir, { includeMeta: false });
       for (const art of arts) {
         registerFile(art.path, entry.canonicalId);
@@ -180,7 +174,6 @@ function findMatchingSessionsWithRg(
   const { files, fileToSession } = collectEligibleRgFiles(entries, scope);
   if (files.length === 0) return new Set();
 
-  // Chunk explicit file arguments to avoid OS command-line length limits (especially on Windows)
   const CHUNK_SIZE = process.platform === "win32" ? 120 : 400;
   const matchedSessions = new Set<string>();
 
@@ -208,7 +201,6 @@ function findMatchingSessionsWithRg(
         chunkDone = true;
         break;
       } catch (err) {
-        // Exit code 1 means "no matches", NOT missing binary
         const status = (err as { status?: unknown })?.status;
         if (typeof status === "number" && status === 1) {
           chunkDone = true;
@@ -273,7 +265,6 @@ function selectDiverseSnippets(
         effective += newTerms * 4.5;
       }
 
-      // Encourage diversity across sources and distant steps
       if (selected.length > 0) {
         const nearExisting = selected.some(
           (picked) =>
@@ -282,13 +273,9 @@ function selectDiverseSnippets(
             cand.stepIndex >= 0 &&
             Math.abs(picked.stepIndex - cand.stepIndex) <= 12,
         );
-        if (nearExisting) {
-          effective -= 2.0;
-        }
+        if (nearExisting) effective -= 2.0;
         const distinctSource = selected.every((picked) => picked.sourceKind !== cand.sourceKind);
-        if (distinctSource) {
-          effective += 1.2;
-        }
+        if (distinctSource) effective += 1.2;
       }
 
       if (
@@ -334,7 +321,6 @@ function scanSessionDoc(
   let titleHitCount = 0;
   let skippedInFlight = false;
 
-  // Scope isolation: only match title/preview when scope === "all"
   if (scope === "all") {
     const titleText = `${entry.title} ${entry.preview}`.trim();
     const titleCheck = matchLowerOrRegex(titleText.toLowerCase(), titleText, terms, regex);
@@ -359,7 +345,6 @@ function scanSessionDoc(
       if (scope === "user" && msg.role !== "user") continue;
       if (scope === "assistant" && msg.role !== "assistant") continue;
 
-      // Auto-skip an active in-flight USER_INPUT prompt (no assistant reply yet) unless caller targeted this session
       if (
         skipInFlightSelfPrompt &&
         isRecentlyActive &&
@@ -454,13 +439,66 @@ function scanSessionDoc(
   };
 }
 
+function formatListedSessions(
+  eligible: SessionEntry[],
+  opts: {
+    coverageLabel: string;
+    scopeFilter: ScopeKey | null;
+    workspace: string;
+    maxSessions: number;
+    maxChars: number;
+    now: number;
+  },
+): ToolResult {
+  const shown = eligible.slice(0, opts.maxSessions);
+  const scopeNote = opts.scopeFilter ? `scope=${formatScopeKey(opts.scopeFilter)}` : `clients=${opts.coverageLabel}`;
+  const wsNote = opts.workspace ? `, workspace~"${opts.workspace}"` : "";
+
+  if (shown.length === 0) {
+    return {
+      text: `No matching conversations found (${scopeNote}${wsNote}).`,
+      isError: false,
+    };
+  }
+
+  const lines = [`Recent conversations (${shown.length} of ${eligible.length} shown; ${scopeNote}${wsNote}):`, ""];
+  for (const s of shown) {
+    const artifacts = listSessionArtifactFiles(s.paths.brainDir, { includeMeta: false });
+    const wsName = s.workspaces[0] ? formatWorkspaceLabel(s.workspaces[0]) : "";
+    const badges: string[] = [];
+    if (s.notFullyIdle) badges.push("active");
+    if (s.hasSwarm) badges.push("swarm");
+    if (artifacts.length > 0) badges.push(`${artifacts.length} artifacts`);
+    if (s.isChild) badges.push("child");
+    const badgeStr = badges.length > 0 ? ` [${badges.join(", ")}]` : "";
+    const title = s.title || "(untitled)";
+    const meta = [
+      formatShortDate(s.updatedMs),
+      formatRelativeTime(s.updatedMs, opts.now),
+      s.client,
+      wsName,
+      s.stepCount > 0 ? `${s.stepCount} steps` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    lines.push(`- **${s.shortId}** (${s.sessionId}) — ${title}${badgeStr}`);
+    lines.push(`  ${meta}`);
+    if (s.preview && s.preview !== s.title) {
+      lines.push(`  Preview: ${safeSliceChars(s.preview.replace(/\s+/g, " ").trim(), 140)}`);
+    }
+  }
+  return { text: truncateUtf8(lines.join("\n"), opts.maxChars), isError: false };
+}
+
 export interface SearchSessionsOptions {
   dataDir?: string;
   query?: string;
   mode?: string;
-  source?: string;
   scope?: string;
   regex?: boolean;
+  conversationId?: string;
+  scopeKey?: string;
+  allScopes?: boolean;
   workspace?: string;
   sessionId?: string;
   includeChildren?: boolean;
@@ -475,12 +513,14 @@ export interface SearchSessionsOptions {
 
 export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResult {
   const {
-    dataDir = resolveDataDir(),
+    dataDir = "",
     query = "",
     mode = "text",
-    source = "agy",
     scope = "all",
     regex: isRegex = false,
+    conversationId = "",
+    scopeKey: explicitScopeStr = "",
+    allScopes = false,
     workspace = "",
     sessionId = "",
     includeChildren = false,
@@ -501,69 +541,105 @@ export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResu
     };
   }
 
-  const parsedSource = parseSourceFilter(source);
-  if (parsedSource.error) {
-    return { text: parsedSource.error, isError: true };
-  }
-
   const targetSessionRef = String(sessionId || "").trim();
-  const explicitTargetSrc = targetSessionRef ? splitCanonicalRef(targetSessionRef).source : null;
-  const effectiveSource: SourceFilter = explicitTargetSrc || parsedSource.source;
-
   const safeMaxSessions = Math.max(1, Math.min(25, Number(maxSessions) || 10));
   const safeMaxSnippets = Math.max(1, Math.min(8, Number(maxSnippetsPerSession) || 3));
   const safeMaxChars = clampMaxChars(maxChars, 8200);
 
-  const { entries: catalog, coverageLabel } = loadFederatedCatalog(dataDir, effectiveSource);
+  const { entries: catalog, coverageLabel } = loadMultiClientCatalog(dataDir);
   const now = Date.now();
   const minMs = sinceDays > 0 ? now - sinceDays * 24 * 3600 * 1000 : 0;
 
-  // Enforce strict single-session resolution (rejecting ambiguous prefixes identically to read_session)
+  let activeScopeFilter: ScopeKey | null = null;
+  let effectiveExclude = excludeSessionId;
+
+  if (!allScopes) {
+    if (explicitScopeStr.trim()) {
+      const parsed = parseExplicitScopeKey(explicitScopeStr);
+      if (!parsed || parsed.kind === "global") {
+        return { text: `Error: Invalid scopeKey "${explicitScopeStr}".`, isError: true };
+      }
+      activeScopeFilter = parsed;
+    } else if (conversationId.trim()) {
+      const ctx = resolveConversationContext({
+        conversationId: conversationId.trim(),
+        overrideDataDir: dataDir,
+        catalog,
+      });
+      if (ctx.scopeKey.kind === "unresolved") {
+        return {
+          text: `Error: Could not resolve project scope for conversation "${conversationId}"${ctx.diagnostic ? ` (${ctx.diagnostic})` : ""}. Pass allScopes=true or workspace to search without project scoping.`,
+          isError: true,
+        };
+      }
+      activeScopeFilter = ctx.scopeKey;
+      if (!targetSessionRef) {
+        effectiveExclude = effectiveExclude ? `${effectiveExclude},${conversationId.trim()}` : conversationId.trim();
+      }
+    } else if (!targetSessionRef && !workspace.trim()) {
+      return {
+        text: 'Error: Pass conversationId (from [agy-memory] startup header) to stay scoped to your project, or set allScopes=true to search across all projects.',
+        isError: true,
+      };
+    }
+  }
+
   let eligible: SessionEntry[];
   if (targetSessionRef) {
-    const resolved = resolveSessionEntry(dataDir, targetSessionRef, catalog, effectiveSource);
+    const resolved = resolveSessionEntry(dataDir, targetSessionRef, catalog);
     if (!resolved.entry) {
       return { text: `Error: ${resolved.error || `No conversation matched "${targetSessionRef}".`}`, isError: true };
     }
     const s = resolved.entry;
+    const scopeMismatch = activeScopeFilter !== null && !scopeKeysEqual(s.scopeKey, activeScopeFilter);
     const excluded =
-      (excludeSessionId && matchesSessionId(s.sessionId, excludeSessionId, s.source)) ||
+      scopeMismatch ||
+      (effectiveExclude && matchesSessionId(s.sessionId, effectiveExclude, s.client)) ||
       (minMs > 0 && s.updatedMs < minMs) ||
       !workspaceMatches(s.workspaces, workspace);
     eligible = excluded ? [] : [s];
   } else {
     eligible = catalog.filter((s) => {
       if (!includeChildren && s.isChild) return false;
-      if (excludeSessionId && matchesSessionId(s.sessionId, excludeSessionId, s.source)) return false;
+      if (activeScopeFilter && !scopeKeysEqual(s.scopeKey, activeScopeFilter)) return false;
+      if (effectiveExclude && matchesSessionId(s.sessionId, effectiveExclude, s.client)) return false;
       if (minMs > 0 && s.updatedMs < minMs) return false;
       if (!workspaceMatches(s.workspaces, workspace)) return false;
       return true;
     });
   }
 
-  // Dispatch deterministic verbatim trace modes directly
   if (safeMode === "file_history") {
     return runFileHistorySearch({
       eligible,
       query,
-      sourceCoverage: coverageLabel,
+      coverageLabel,
       maxSessions: safeMaxSessions,
       maxChars: safeMaxChars,
       maxScanBytes,
       maxScanMs,
-      workspace,
     });
   }
   if (safeMode === "error_history") {
     return runErrorHistorySearch({
       eligible,
       query,
-      sourceCoverage: coverageLabel,
+      coverageLabel,
       maxSessions: safeMaxSessions,
       maxChars: safeMaxChars,
       maxScanBytes,
       maxScanMs,
+    });
+  }
+
+  if (!String(query || "").trim()) {
+    return formatListedSessions(eligible, {
+      coverageLabel,
+      scopeFilter: activeScopeFilter,
       workspace,
+      maxSessions: safeMaxSessions,
+      maxChars: safeMaxChars,
+      now,
     });
   }
 
@@ -580,14 +656,18 @@ export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResu
     return { text: parsed.error, isError: true };
   }
   const { terms, regex } = parsed;
+  if (terms.length === 0) {
+    return formatListedSessions(eligible, {
+      coverageLabel,
+      scopeFilter: activeScopeFilter,
+      workspace,
+      maxSessions: safeMaxSessions,
+      maxChars: safeMaxChars,
+      now,
+    });
+  }
 
-  // Start budget clock BEFORE prefilter so rg I/O is accounted for cleanly
   const budget = createScanBudget(maxScanBytes, maxScanMs);
-
-  // Decide which sessions need scanning:
-  // - ALWAYS bypass raw-file rg prefilter for regex queries (rg sees serialized JSON lines, JS sees decoded text).
-  // - For literal queries, keep rg prefilter only when tokens cannot be JSON-escaped differently, and preserve
-  //   title/preview hits and artifact-filename-only hits in memory.
   const hasJsonSpecial = terms.some((t) => JSON_ESCAPED_CHAR_RE.test(t));
   const uncachedEntries = eligible.filter((s) => !isSessionDocCached(s));
 
@@ -611,7 +691,7 @@ export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResu
           const lowTitle = `${s.title} ${s.preview}`.trim().toLowerCase();
           if (lowTitle.includes(seedTerm)) return true;
         }
-        if (checkArtifactNames && s.source === "agy") {
+        if (checkArtifactNames) {
           const arts = listSessionArtifactFiles(s.paths.brainDir, { includeMeta: false });
           if (arts.some((a) => a.name.toLowerCase().includes(seedTerm))) return true;
         }
@@ -652,9 +732,12 @@ export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResu
     ? `INCOMPLETE SCAN (${budget.sessionsScanned}/${toScan.length} candidates, ${(budget.bytesRead / (1024 * 1024)).toFixed(1)} MB; ${budget.reason}; narrow with workspace/sinceDays — do NOT treat 0-match as authoritative).`
     : "";
 
+  const scopeDesc = activeScopeFilter ? `projectScope=${formatScopeKey(activeScopeFilter)}` : `clients=${coverageLabel}`;
+
   if (top.length === 0) {
     const scopeLabel = safeScope === "all" ? "transcripts, artifacts, and swarm boards" : safeScope;
     const filters: string[] = [];
+    if (activeScopeFilter) filters.push(`projectScope=${formatScopeKey(activeScopeFilter)}`);
     if (workspace) filters.push(`workspace~"${workspace}"`);
     if (targetSessionRef) filters.push(`sessionId="${targetSessionRef}"`);
     if (skippedInFlightCount > 0) filters.push("excluded active in-flight prompt");
@@ -663,24 +746,23 @@ export function searchSessionsResult(opts: SearchSessionsOptions = {}): ToolResu
       ? `\n${incompleteNote}`
       : `\nComplete scan (${eligible.length} eligible session(s), ${coverageLabel}).\nNote: text mode searches user/assistant replies, artifacts, and Swarm only; for failed commands/exit codes or tool file edits, try mode="error_history" or mode="file_history".`;
     return {
-      text: `No past conversations matched "${query}" (searched ${eligible.length} session(s) [${coverageLabel}] across ${scopeLabel}${filterSuffix}).${statusLine}`,
+      text: `No past conversations matched "${query}" (searched ${eligible.length} session(s) [${scopeDesc}] across ${scopeLabel}${filterSuffix}).${statusLine}`,
       isError: false,
     };
   }
 
   const lines = [
-    `Search "${query}" — ${results.length} matching conversation(s) (showing top ${top.length}, scope=${safeScope}, sources=${coverageLabel}${targetSessionRef ? `, session=${targetSessionRef}` : ""}):`,
+    `Search "${query}" — ${results.length} matching conversation(s) (showing top ${top.length}, scope=${safeScope}, ${scopeDesc}${targetSessionRef ? `, session=${targetSessionRef}` : ""}):`,
   ];
   if (incompleteNote) lines.push(incompleteNote);
 
   for (const r of top) {
     const e = r.entry;
-    const wsName = e.workspaces.length > 0 ? formatWorkspaceLabel(e.workspaces[0] ?? "") : "";
-    const dispId = e.source === "agy" ? e.shortId : `${e.source}:${e.shortId}`;
+    const wsName = e.workspaces[0] ? formatWorkspaceLabel(e.workspaces[0]) : "";
     lines.push(
-      `\n### ${dispId} — ${e.title || "(untitled)"} (${formatShortDate(e.updatedMs)}, ${formatRelativeTime(e.updatedMs, now)}${wsName ? `, ${wsName}` : ""})`,
+      `\n### ${e.shortId} — ${e.title || "(untitled)"} (${formatShortDate(e.updatedMs)}, ${formatRelativeTime(e.updatedMs, now)}${wsName ? `, ${wsName}` : ""})`,
     );
-    lines.push(`ID: ${e.source === "agy" ? e.sessionId : e.canonicalId}`);
+    lines.push(`ID: ${e.sessionId}`);
     if (r.snippets.length === 0 && r.titleMatched) {
       lines.push(`- [title] ${e.title || e.preview}`);
     } else {
