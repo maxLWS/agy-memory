@@ -52,7 +52,7 @@ Start a new Antigravity session after installing.
 
 - **Shared Project memory on Turn 0, with real isolation.** Named Projects resolve by `project_id` (reading Protobuf field 18 from `conversations/<id>.db` before `conversation_summaries.db` is populated), so two Projects pointing at the same folder never bleed into each other. Plain CLI sessions unify linked Git worktrees automatically.
 - **Full forensic archive kept intact and unclipped.** Search hydrates truncated turns from `transcript_full.jsonl`, proves which session *edited* vs. only *read* a file (`mode="file_history"`), traces command failures with later passing reruns (`mode="error_history"`), and in `v0.4.1` reads full single Swarm messages without the old 1,400-char cutoff.
-- **Lighter than every previous version.** Cutting Codex/Claude adapters, the legacy global-lock notes store, and standalone `list_sessions` brought the plugin down to **4 tools**, **-670 lines of source**, a **58.5 ms** startup hook, and the **lowest Turn-1 token cost since `v0.1.0`** (`-20%` vs. `v0.3.0`, `-32%` vs. `v0.2.0`).
+- **Lighter than every previous version.** Cutting Codex/Claude adapters, the legacy global-lock notes store, and standalone `list_sessions` brought the plugin down to **4 tools**, **-341 lines of source vs. `v0.3.0`** (`6,309 -> 5,968`), a **58.5 ms** startup hook, and the **lowest Turn-1 token cost since `v0.1.0`** (`-20%` vs. `v0.3.0`, `-32%` vs. `v0.2.0`).
 
 ## Benchmarks (`v0.1.0` -> `v0.4.1`)
 
@@ -62,9 +62,9 @@ Measured across **150+ real isolated `agy -p` runs** on `gemini-3.8-flash-medium
 
 | Version | Archive Recall (`T1–T7`) | File / Error / Swarm Trace | Blackboard & Isolation (`B1–B5`) | Turn-1 Prompt Tax |
 | :--- | :--- | :--- | :--- | :--- |
-| **No plugin** | `594.4s` model, `699k` tok, `10` spills | `file`: `113.5s` · `error`: `78.2s` · Swarm: Timeout (`125.7s`) | `0/15` (0%) | Baseline (`9,617` tok) |
+| **No plugin** | `594.4s` model, `699k` tok, `10` spills | `file`: `113.5s` · `error`: `78.2s` *(pre-hint `v0.3`)* · Swarm: Timeout (`125.7s`) | `0/15` (0%) | Baseline (`9,617` tok) |
 | **`v0.2.0`** | **`213.2s` (-64%)**, `374k` tok, **`0` spills** | No trace mode (`90.0s`) | No `project_id` board | `+3,907` tok (`11,022 B`) |
-| **`v0.3.0`** | **`208.7s` (-65%)**, `375k` tok, **`0` spills** | `file`: **`21.6s`** · `error`: **`21.6s`** · Swarm: Timeout (`126.0s`) | `11/15` Gemini, `6/10` Claude (**0/5 dual-project bleed**) | `+3,304` tok (`7,674 B`) |
+| **`v0.3.0`** | **`208.7s` (-65%)**, `375k` tok, **`0` spills** | `file`: **`21.6s`** · `error`: **`21.6s`** · Swarm: Timeout (`126.0s`) | `11/15` Gemini, `6/10` Claude (**0/5 dual-project pass, 5/5 bleed**) | `+3,304` tok (`7,674 B`) |
 | **`v0.4.1`** | Preserved (`T7` `44.7s`, `T9` `16.9s`, `0` spills) | **`file`/`error` kept + Swarm `50.4s` / `5` turns / `0` spills** | **`15/15` Gemini, `10/10` Claude (5/5 zero bleed)** | **`+2,648` tok (`7,092 B`, 4 tools)** |
 
 Full per-task tables, medians, ranges, and every defect we fixed from `v0.1.0` to `v0.4.1`: [docs/BENCHMARK_REPORT.md](./docs/BENCHMARK_REPORT.md).
@@ -91,8 +91,9 @@ When Chat B starts in that Project, `SessionStart` injects the whole board (when
 
 ```text
 [agy-memory] session=51459fb0 (id=51459fb0-..., scope=project/api-v2)
-Project board (1 entry, 184 B):
-- retry-policy [rev=e6aa61696c47, src=cli:a629d4f8]: Use `retry_backoff_ms=450`, header `X-Epoch-812`, and `max_batch=32`.
+Project board (1 active, inline):
+## retry-policy — HTTP retry policy (rev=e6aa61696c47 · 2h ago · from a629d4f8)
+Use `retry_backoff_ms=450`, header `X-Epoch-812`, and `max_batch=32`.
 ```
 
 ![agy-memory v0.4 architecture](./assets/architecture.svg)

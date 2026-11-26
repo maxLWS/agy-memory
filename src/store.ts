@@ -771,6 +771,17 @@ export function loadMultiClientCatalog(overrideDir = ""): {
     });
     const newest = copies[0]!;
     const transcriptBearing = copies.find((c) => c.hasTranscript) || newest;
+    const swarmBearing = copies.find((c) => c.hasSwarm) || newest;
+    const mergedPaths =
+      swarmBearing === transcriptBearing
+        ? transcriptBearing.paths
+        : {
+            ...transcriptBearing.paths,
+            swarmDir: swarmBearing.paths.swarmDir,
+            swarmMembersPath: swarmBearing.paths.swarmMembersPath,
+            swarmBoardPath: swarmBearing.paths.swarmBoardPath,
+            swarmPlanPath: swarmBearing.paths.swarmPlanPath,
+          };
     const distinctProjectIds = new Set(copies.map((c) => c.projectId).filter(Boolean));
     const distinctScopes = new Set(
       copies.filter((c) => c.scopeKey.kind !== "unresolved").map((c) => formatScopeKey(c.scopeKey)),
@@ -785,9 +796,9 @@ export function loadMultiClientCatalog(overrideDir = ""): {
     merged.push({
       ...newest,
       dataDir: transcriptBearing.dataDir,
-      paths: transcriptBearing.paths,
-      hasTranscript: newest.hasTranscript || transcriptBearing.hasTranscript,
-      hasSwarm: newest.hasSwarm || transcriptBearing.hasSwarm,
+      paths: mergedPaths,
+      hasTranscript: copies.some((c) => c.hasTranscript),
+      hasSwarm: copies.some((c) => c.hasSwarm),
       projectId: chosenProjectId,
       workspaces: chosenWorkspaces,
       scopeKey: chosenScope,
@@ -1338,7 +1349,7 @@ function formatSwarmMode(
 ): ToolResult {
   if (!entry.hasSwarm) {
     return {
-      text: `Session ${entry.shortId} (${entry.title || "untitled"}) has no Swarm data.`,
+      text: truncateUtf8(`Session ${entry.shortId} (${entry.title || "untitled"}) has no Swarm data.`, safeMaxChars),
       isError: false,
     };
   }
@@ -1404,7 +1415,7 @@ function formatSwarmMode(
   const forwardFromStart = hasStartSeq && !hasEndSeq;
   const candidateSlice = forwardFromStart ? matched.slice(0, limitMsgs) : matched.slice(-limitMsgs);
 
-  const reserveForSummaryAndFooter = 280;
+  const reserveForSummaryAndFooter = 360 + Buffer.byteLength(query, "utf8");
   const headerText = headerLines.join("\n");
   const maxBodyChars = Math.max(400, safeMaxChars - headerText.length - reserveForSummaryAndFooter);
   const maxBodyBytes = Math.max(400, 8650 - Buffer.byteLength(headerText, "utf8") - reserveForSummaryAndFooter);
@@ -1421,15 +1432,21 @@ function formatSwarmMode(
   const formatMsgBlock = (msg: SwarmBoardMessage): string => {
     const body = msg.text;
     const msgHeader = `\n[#${msg.seq} ${msg.time || ""} · ${msg.agent}${msg.kind ? ` (${msg.kind})` : ""}]\n`;
-    const effectiveClip = Math.max(200, bodyClipLen - msgHeader.length);
-    if (body.length <= effectiveClip) {
+    const msgHeaderBytes = Buffer.byteLength(msgHeader, "utf8");
+    const effectiveCharClip = Math.max(200, bodyClipLen - msgHeader.length);
+    const effectiveByteClip = Math.max(
+      200,
+      (candidateSlice.length === 1 ? maxBodyBytes : Math.min(maxBodyBytes, bodyClipLen * 2)) - msgHeaderBytes,
+    );
+    const bodyBytes = Buffer.byteLength(body, "utf8");
+    if (body.length <= effectiveCharClip && bodyBytes <= effectiveByteClip) {
       return `${msgHeader}${body}`;
     }
     const hint =
       candidateSlice.length === 1
-        ? `… [clipped at ${effectiveClip}/${body.length} chars; full board: ${entry.paths.swarmBoardPath}]`
-        : `… [clipped at ${effectiveClip}/${body.length} chars; pass startSeq=${msg.seq} endSeq=${msg.seq} for full message]`;
-    return `${msgHeader}${safeSliceChars(body, Math.max(120, effectiveClip - hint.length))}${hint}`;
+        ? `… [clipped (${body.length} chars / ${bodyBytes} B); full board: ${entry.paths.swarmBoardPath}]`
+        : `… [clipped (${body.length} chars); pass startSeq=${msg.seq} endSeq=${msg.seq} for full message]`;
+    return `${msgHeader}${truncateUtf8(body, effectiveCharClip, effectiveByteClip, hint)}`;
   };
 
   const chosen: Array<{ msg: SwarmBoardMessage; block: string }> = [];
@@ -1862,7 +1879,7 @@ export function readSessionResult(opts: ReadSessionOptions = {}): ToolResult {
   }
   const nextOffset = safeOffset + chunk.length;
   const footer = `\n… [truncated; pass charOffset=${nextOffset} (of ${fullBody.length}) to read more]`;
-  return { text: `${headerBlock}\n${chunk.trimEnd()}${footer}`, isError: false };
+  return { text: truncateUtf8(`${headerBlock}\n${chunk.trimEnd()}${footer}`, safeMaxChars), isError: false };
 }
 
 export function readSessionFormatted(opts: ReadSessionOptions = {}): string {

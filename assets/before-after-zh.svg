@@ -19,7 +19,7 @@
   <text x="64" y="262" fill="#475569" font-family="PingFang SC, Microsoft YaHei, ui-monospace, monospace" font-size="10">  被迫退回跑 11-23 次 shell 翻盘 -&gt; 126 秒超时失败</text>
 
   <rect x="40" y="282" width="452" height="40" rx="6" fill="#FEE2E2"/>
-  <text x="54" y="307" fill="#991B1B" font-family="PingFang SC, Microsoft YaHei, ui-sans-serif, sans-serif" font-size="12" font-weight="700">结果：裸 agy 0/15 通过 · v0.3.0 双项目隔离 0/5 串味</text>
+  <text x="54" y="307" fill="#991B1B" font-family="PingFang SC, Microsoft YaHei, ui-sans-serif, sans-serif" font-size="12" font-weight="700">结果：裸 agy 0/15 通过 · v0.3.0 双项目隔离 0/5 通过</text>
 
   <!-- Right: With agy-memory v0.4.1 -->
   <rect x="532" y="74" width="484" height="262" rx="10" fill="#F0FDF4" stroke="#86EFAC" stroke-width="1.4"/>

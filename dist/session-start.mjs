@@ -978,6 +978,14 @@ function loadMultiClientCatalog(overrideDir = "") {
     });
     const newest = copies[0];
     const transcriptBearing = copies.find((c) => c.hasTranscript) || newest;
+    const swarmBearing = copies.find((c) => c.hasSwarm) || newest;
+    const mergedPaths = swarmBearing === transcriptBearing ? transcriptBearing.paths : {
+      ...transcriptBearing.paths,
+      swarmDir: swarmBearing.paths.swarmDir,
+      swarmMembersPath: swarmBearing.paths.swarmMembersPath,
+      swarmBoardPath: swarmBearing.paths.swarmBoardPath,
+      swarmPlanPath: swarmBearing.paths.swarmPlanPath
+    };
     const distinctProjectIds = new Set(copies.map((c) => c.projectId).filter(Boolean));
     const distinctScopes = new Set(
       copies.filter((c) => c.scopeKey.kind !== "unresolved").map((c) => formatScopeKey(c.scopeKey))
@@ -989,9 +997,9 @@ function loadMultiClientCatalog(overrideDir = "") {
     merged.push({
       ...newest,
       dataDir: transcriptBearing.dataDir,
-      paths: transcriptBearing.paths,
-      hasTranscript: newest.hasTranscript || transcriptBearing.hasTranscript,
-      hasSwarm: newest.hasSwarm || transcriptBearing.hasSwarm,
+      paths: mergedPaths,
+      hasTranscript: copies.some((c) => c.hasTranscript),
+      hasSwarm: copies.some((c) => c.hasSwarm),
       projectId: chosenProjectId,
       workspaces: chosenWorkspaces,
       scopeKey: chosenScope

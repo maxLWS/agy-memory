@@ -5,7 +5,7 @@ import { executeToolResult, TOOL_DEFINITIONS } from "./tools.js";
 
 const SERVER_INFO = {
   name: "agy-memory",
-  version: "0.4.1",
+  version: "0.4.2",
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS = new Set([
@@ -249,6 +249,8 @@ const BOOLEAN_CLI_FLAGS = new Set([
   "all-scopes",
   "regex",
   "include-children",
+  "tools",
+  "thinking",
   "include-tools",
   "include-thinking",
   "delete",
@@ -352,8 +354,11 @@ function runCliMode(argv: string[]): void {
   }
 
   if (sub === "read") {
-    const toolsFlag = parseBoolFlag(flags, "tools");
-    const thinkingFlag = parseBoolFlag(flags, "thinking");
+    const toolsFlag = parseBoolFlag(flags, flags["include-tools"] !== undefined ? "include-tools" : "tools");
+    const thinkingFlag = parseBoolFlag(
+      flags,
+      flags["include-thinking"] !== undefined ? "include-thinking" : "thinking",
+    );
     if (failBool(toolsFlag) || failBool(thinkingFlag)) return;
     const sessionId = positional[1] || flagString(flags, "session");
     const { text, isError } = executeToolResult(
@@ -424,6 +429,8 @@ function runCliMode(argv: string[]): void {
   }
 
   if (sub === "migrate-notes") {
+    const dryRunFlag = parseBoolFlag(flags, "dry-run");
+    if (failBool(dryRunFlag)) return;
     const rawTarget = flagString(flags, "scope") || "global";
     const parsedTarget = parseExplicitScopeKey(rawTarget);
     if (!parsedTarget) {
@@ -436,9 +443,11 @@ function runCliMode(argv: string[]): void {
       sourceDataDir,
       targetScope: parsedTarget,
       boardsHome: execOpts.boardsHome,
+      dryRun: dryRunFlag.value,
     });
+    const prefix = dryRunFlag.value ? "[dry-run] " : "";
     process.stdout.write(
-      `Migrated legacy notes from ${sourceDataDir}: imported=${res.imported}, skipped=${res.skipped}\n${res.details.join("\n")}\n`,
+      `${prefix}Migrated legacy notes from ${sourceDataDir}: imported=${res.imported}, skipped=${res.skipped}\n${res.details.join("\n")}\n`,
     );
     return;
   }
@@ -450,7 +459,7 @@ function runCliMode(argv: string[]): void {
       "  node dist/mcp-server.mjs --cli board-post --key <slug> --body <md> [--title <t>] [--conversation <id> | --scope global|project/<id>] [--rev <hash>] [--delete]",
       "  node dist/mcp-server.mjs --cli search [--mode text|file_history|error_history] [--conversation <id>] [--all-scopes] [--workspace <dir>] [--limit 10] [query]",
       "  node dist/mcp-server.mjs --cli read <sessionId> [--mode digest|turns|artifacts|swarm] [--tail 20] [--start-seq N] [--end-seq N] [--char-offset N]",
-      "  node dist/mcp-server.mjs --cli migrate-notes --scope global|project/<id> [--data-dir <dir>]",
+      "  node dist/mcp-server.mjs --cli migrate-notes --scope global|project/<id> [--data-dir <dir>] [--dry-run]",
     ].join("\n") + "\n",
   );
 }

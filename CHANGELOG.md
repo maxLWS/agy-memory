@@ -2,6 +2,18 @@
 
 All notable changes to `agy-memory` are listed here.
 
+## [0.4.2] - 2026-11-26
+
+### Fixed
+- **Legacy v0.3 Markdown notes migration path (`--cli migrate-notes`)**: fixed `migrateLegacyNotes` in `src/board.ts` to read the real `v0.3.0` topics directory (`<dataDir>/plugin_data/agy-memory/memory/topics`, with fallback to `<dataDir>/memory/topics`), and wired `--dry-run` so preview mode reports planned imports without writing to disk.
+- **Strict boolean parsing at the MCP tool boundary (`src/tools.ts`)**: stopped coercing string `"false"` to `true` via `Boolean(...)` for `allScopes`, `delete`, `regex`, `includeChildren`, `includeTools`, and `includeThinking`.
+- **Multibyte CJK Swarm message recovery path (`src/store.ts`)**: checked both character length and UTF-8 byte length when formatting Swarm messages so oversized CJK single-message reads always include the full `board.jsonl` path inside the `<= 8,650`-byte inline cap.
+- **CLI `read` boolean flags (`src/mcp-server.ts`)**: accepted both `--tools` / `--include-tools` and `--thinking` / `--include-thinking` in `BOOLEAN_CLI_FLAGS` so neither spelling swallows the positional session ID or gets ignored.
+- **Multi-client Swarm path merge & byte-cap safety (`src/store.ts`)**: preserved `swarm*` paths from the Swarm-bearing copy during cross-client merge and wrapped remaining `read_session` return paths in `truncateUtf8`.
+
+### Removed
+- Deleted unused legacy `scripts/analytics.ts` left over from `v0.3.0`.
+
 ## [0.4.1] - 2026-11-26
 
 ### Fixed

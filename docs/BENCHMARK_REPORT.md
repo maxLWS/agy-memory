@@ -12,10 +12,10 @@ All workspace paths, real session IDs, and private project terms are anonymized.
 
 | Version | Core Focus | Archive Recall (`T1–T7` V1) | Trace (`file` / `error` / Swarm `F1`) | Blackboard & Isolation (`B1–B5`) | Startup Metadata & Turn-1 Tax |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Baseline (no plugin)** | Raw `agy` (`grep` / `sqlite3`) | `7/7` (`594.4s` model, `699.0k` tok, `10` spills) | `file`: `113.5s` · `error`: `78.2s` · `F1`: Timeout (`125.7s`) | **0/15** (0%) | `0 B` (`9,617` tok baseline on `T12`) |
+| **Baseline (no plugin)** | Raw `agy` (`grep` / `sqlite3`) | `7/7` (`594.4s` model, `699.0k` tok, `10` spills) | `file`: `113.5s` · `error`: `78.2s` *(pre-hint `v0.3`)* · `F1`: Timeout (`125.7s`) | **0/15** (0%) | `0 B` (`9,617` tok baseline on `T12`) |
 | **`v0.1.0`** | Initial 5-tool MCP + snapshot | `6/7` (`282.6s` model, `463.0k` tok, `5` spills; `T7` timeout) | Not yet implemented | No `project_id` board | — |
 | **`v0.2.0`** | TS bundle, `node:sqlite`, newest-first Swarm, self-match fix | **`7/7`** (`213.2s` model `-64.1%`, `373.7k` `-46.5%`, **`0` spills**) | `file` (no trace): `90.0s` / `12` turns | No `project_id` board | `11,022 B` (`+3,907` tok vs. baseline) |
-| **`v0.3.0`** | `file_history`, `error_history`, Markdown notes, Codex/Claude | **`7/7`** (`208.7s` model `-64.9%`, `375.0k`, **`0` spills**) | `file`: **`21.6s`** (`-81%`) · `error`: **`21.6s`** (`-72%`, `0` spills) · `F1`: Timeout (`126.0s`) | `11/15` Gemini, `6/10` Claude (**0/5 dual-project bleed**) | `7,674 B` (`+3,304` tok on `T12`) |
+| **`v0.3.0`** | `file_history`, `error_history`, Markdown notes, Codex/Claude | **`7/7`** (`208.7s` model `-64.9%`, `375.0k`, **`0` spills**) | `file`: **`21.6s`** (`-81%`) · `error`: **`21.6s`** (`-72%`, `0` spills) · `F1`: Timeout (`126.0s`) | `11/15` Gemini, `6/10` Claude (**0/5 dual-project pass, 5/5 bleed**) | `7,674 B` (`+3,304` tok on `T12`) |
 | **`head_1b6aaa02`** | Post-v0.3 expanded tool schemas | Same engine as `v0.3.0` | Same engine as `v0.3.0` | Same as `v0.3.0` | `13,946 B` (`+4,401` tok on `T12`) |
 | **`v0.4.0`** | Project Blackboard, `ScopeKey` (`project_id`), 4 tools, cut Codex/Claude | `T1/T7/T9/F2` **4/4** (`T7` `44.7s` / `0` spills, `T9` `16.9s` / `2` turns) | Same trace engine · `F1`: Timeout (`126.5s`, 1,400-char Swarm clip) | **15/15** Gemini (**3/3 zero bleed** on `B4`) | **`7,092 B`** (**`+2,648` tok**, `-656` vs. `v0.3.0`, `-1,753` vs. `HEAD`) |
 | **`v0.4.1`** | Unclipped single-message Swarm reads + Windows CI test portability | All archive & trace gains preserved | **`F1`: `50.4s` (-60%), `5` turns (-78%), `63.9k` (-67%), `0` spills** | **15/15** Gemini, **10/10** Claude Sonnet 5.5 (**5/5 zero bleed**) | **`7,092 B`** (`4` tools / `43` params, `58.5 ms` p50 hook) |
@@ -52,10 +52,10 @@ Measured on a deterministic 60-session dual-project fixture (`scripts/stress-ben
 | **`v0.2.0`** | 5 | 49 | 5,180 B | 5,842 B | 11,022 B | — | 44.0 ms (V1 fixture) |
 | **`v0.3.0`** | 5 | 52 | 5,393 B | 2,281 B | 7,674 B | 181,521 B | 186–226 ms (host tail scan) |
 | **`head_1b6aaa02`** | 5 | 52 | 11,665 B | 2,281 B | 13,946 B | 190,337 B | 186–226 ms |
-| **`v0.4.1`** | **4** | **43** | 5,731 B | **1,361 B** | **7,092 B** | **168,940 B** | **58.5 ms p50** (range `56.5–79.5 ms`) |
+| **`v0.4.1 / v0.4.2`** | **4** | **43** | 5,731 B | **1,361 B** | **7,092 B** | **172,005 B** *(169,082 B in `v0.4.1`)* | **58.5 ms p50** (range `56.5–79.5 ms`) |
 
-- Production source (`src/*.ts`) shrank from `6,570` lines (`v0.3.0`) to `5,900` lines (`v0.4.1`, net `-670` lines) after deleting Codex/Claude adapters (`~500` LOC), legacy `notes.ts` (`730` LOC), and moving `analytics.ts` (`233` LOC) out of the runtime bundle while adding `scope.ts`, `board.ts`, and `stream.ts`.
-- All 12 unit and regression suites (`npm test`) and `agy plugin validate --strict` pass cleanly, including multi-process CAS contention, WAL busy-timeout reads, exact 1,535/1,536/1,537 UTF-8 byte boundary tests, cross-client `project_id` conflict fail-closed checks, dead-PID lock reaping, live-PID lock preservation, and unclipped 3.5 KB single-message Swarm reads.
+- Production source (`src/*.ts`) shrank from `6,309` tracked lines (`v0.3.0`) to `5,903` lines (`v0.4.1`, `-406` lines) and `5,968` lines (`v0.4.2`, `-341` lines) after deleting Codex/Claude adapters (`~500` LOC), legacy `notes.ts` (`730` LOC), and legacy `analytics.ts` (`233` LOC) while adding `scope.ts`, `board.ts`, and `stream.ts`.
+- All 13 unit and regression suites (`npm test`) and `agy plugin validate --strict` pass cleanly, including multi-process CAS contention, WAL busy-timeout reads, exact 1,535/1,536/1,537 UTF-8 byte boundary tests, cross-client `project_id` conflict fail-closed checks, dead-PID lock reaping, live-PID lock preservation, unclipped 3.5 KB single-message Swarm reads, multibyte CJK Swarm recovery paths, strict MCP boolean parsing, and `v0.3.0` notes migration (`--dry-run`).
 
 ---
 

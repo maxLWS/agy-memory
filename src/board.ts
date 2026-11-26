@@ -587,6 +587,7 @@ export function migrateLegacyNotes(opts: {
   sourceDataDir: string;
   targetScope: ScopeKey;
   boardsHome?: string;
+  dryRun?: boolean;
 }): MigrateLegacyNotesResult {
   const details: string[] = [];
   let imported = 0;
@@ -597,12 +598,21 @@ export function migrateLegacyNotes(opts: {
   }
 
   const boardsHome = resolveBoardsHome(opts.boardsHome);
-  const topicsDir = path.join(path.resolve(opts.sourceDataDir), "memory", "topics");
-  const legacyJson = path.join(path.resolve(opts.sourceDataDir), "plugin_data", "agy-memory", "notes.json");
+  const resolvedSource = path.resolve(opts.sourceDataDir);
+  const topicDirs = [
+    path.join(resolvedSource, "plugin_data", "agy-memory", "memory", "topics"),
+    path.join(resolvedSource, "memory", "topics"),
+  ];
+  const topicsDir = topicDirs.find((dir) => fs.existsSync(dir)) || "";
+  const legacyJsonPaths = [
+    path.join(resolvedSource, "plugin_data", "agy-memory", "notes.json"),
+    path.join(resolvedSource, "notes.json"),
+  ];
+  const legacyJson = legacyJsonPaths.find((filePath) => fs.existsSync(filePath)) || "";
 
   const candidates: Array<{ key: string; title: string; body: string; sourceSession: string }> = [];
 
-  if (fs.existsSync(topicsDir)) {
+  if (topicsDir) {
     for (const fn of fs.readdirSync(topicsDir).filter((f) => f.endsWith(".md")).sort()) {
       const raw = fs.readFileSync(path.join(topicsDir, fn), "utf8").replace(/\r\n/g, "\n");
       const slug = normalizeBoardKey(path.basename(fn, ".md").replace(/[^a-zA-Z0-9._-]/g, "-")).slice(0, 64);
@@ -628,7 +638,7 @@ export function migrateLegacyNotes(opts: {
         candidates.push({ key: slug, title, body, sourceSession });
       }
     }
-  } else if (fs.existsSync(legacyJson)) {
+  } else if (legacyJson) {
     try {
       const arr = JSON.parse(fs.readFileSync(legacyJson, "utf8")) as Array<Record<string, unknown>>;
       if (Array.isArray(arr)) {
@@ -655,7 +665,12 @@ export function migrateLegacyNotes(opts: {
     const existingPath = path.join(existingDir, `${c.key}.md`);
     if (fs.existsSync(existingPath)) {
       skipped += 1;
-      details.push(`Skipped existing key "${c.key}"`);
+      details.push(`${opts.dryRun ? "Would skip" : "Skipped"} existing key "${c.key}"`);
+      continue;
+    }
+    if (opts.dryRun) {
+      imported += 1;
+      details.push(`Would import "${c.key}" -> ${formatScopeKey(opts.targetScope)}`);
       continue;
     }
     const res = boardPostResult({

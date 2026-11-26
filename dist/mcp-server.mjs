@@ -926,10 +926,19 @@ function migrateLegacyNotes(opts) {
     throw new Error("targetScope must be resolved before migrating notes.");
   }
   const boardsHome = resolveBoardsHome(opts.boardsHome);
-  const topicsDir = path2.join(path2.resolve(opts.sourceDataDir), "memory", "topics");
-  const legacyJson = path2.join(path2.resolve(opts.sourceDataDir), "plugin_data", "agy-memory", "notes.json");
+  const resolvedSource = path2.resolve(opts.sourceDataDir);
+  const topicDirs = [
+    path2.join(resolvedSource, "plugin_data", "agy-memory", "memory", "topics"),
+    path2.join(resolvedSource, "memory", "topics")
+  ];
+  const topicsDir = topicDirs.find((dir) => fs2.existsSync(dir)) || "";
+  const legacyJsonPaths = [
+    path2.join(resolvedSource, "plugin_data", "agy-memory", "notes.json"),
+    path2.join(resolvedSource, "notes.json")
+  ];
+  const legacyJson = legacyJsonPaths.find((filePath) => fs2.existsSync(filePath)) || "";
   const candidates = [];
-  if (fs2.existsSync(topicsDir)) {
+  if (topicsDir) {
     for (const fn of fs2.readdirSync(topicsDir).filter((f) => f.endsWith(".md")).sort()) {
       const raw = fs2.readFileSync(path2.join(topicsDir, fn), "utf8").replace(/\r\n/g, "\n");
       const slug = normalizeBoardKey(path2.basename(fn, ".md").replace(/[^a-zA-Z0-9._-]/g, "-")).slice(0, 64);
@@ -955,7 +964,7 @@ function migrateLegacyNotes(opts) {
         candidates.push({ key: slug, title, body, sourceSession });
       }
     }
-  } else if (fs2.existsSync(legacyJson)) {
+  } else if (legacyJson) {
     try {
       const arr = JSON.parse(fs2.readFileSync(legacyJson, "utf8"));
       if (Array.isArray(arr)) {
@@ -981,7 +990,12 @@ function migrateLegacyNotes(opts) {
     const existingPath = path2.join(existingDir, `${c.key}.md`);
     if (fs2.existsSync(existingPath)) {
       skipped += 1;
-      details.push(`Skipped existing key "${c.key}"`);
+      details.push(`${opts.dryRun ? "Would skip" : "Skipped"} existing key "${c.key}"`);
+      continue;
+    }
+    if (opts.dryRun) {
+      imported += 1;
+      details.push(`Would import "${c.key}" -> ${formatScopeKey(opts.targetScope)}`);
       continue;
     }
     const res = boardPostResult({
@@ -1627,6 +1641,14 @@ function loadMultiClientCatalog(overrideDir = "") {
     });
     const newest = copies[0];
     const transcriptBearing = copies.find((c) => c.hasTranscript) || newest;
+    const swarmBearing = copies.find((c) => c.hasSwarm) || newest;
+    const mergedPaths = swarmBearing === transcriptBearing ? transcriptBearing.paths : {
+      ...transcriptBearing.paths,
+      swarmDir: swarmBearing.paths.swarmDir,
+      swarmMembersPath: swarmBearing.paths.swarmMembersPath,
+      swarmBoardPath: swarmBearing.paths.swarmBoardPath,
+      swarmPlanPath: swarmBearing.paths.swarmPlanPath
+    };
     const distinctProjectIds = new Set(copies.map((c) => c.projectId).filter(Boolean));
     const distinctScopes = new Set(
       copies.filter((c) => c.scopeKey.kind !== "unresolved").map((c) => formatScopeKey(c.scopeKey))
@@ -1638,9 +1660,9 @@ function loadMultiClientCatalog(overrideDir = "") {
     merged.push({
       ...newest,
       dataDir: transcriptBearing.dataDir,
-      paths: transcriptBearing.paths,
-      hasTranscript: newest.hasTranscript || transcriptBearing.hasTranscript,
-      hasSwarm: newest.hasSwarm || transcriptBearing.hasSwarm,
+      paths: mergedPaths,
+      hasTranscript: copies.some((c) => c.hasTranscript),
+      hasSwarm: copies.some((c) => c.hasSwarm),
       projectId: chosenProjectId,
       workspaces: chosenWorkspaces,
       scopeKey: chosenScope
@@ -2076,7 +2098,7 @@ function formatSwarmMode(entry, {
 }) {
   if (!entry.hasSwarm) {
     return {
-      text: `Session ${entry.shortId} (${entry.title || "untitled"}) has no Swarm data.`,
+      text: truncateUtf8(`Session ${entry.shortId} (${entry.title || "untitled"}) has no Swarm data.`, safeMaxChars),
       isError: false
     };
   }
@@ -2129,7 +2151,7 @@ function formatSwarmMode(entry, {
   const limitMsgs = Math.max(1, Math.min(100, Number(tailMessages) || 20));
   const forwardFromStart = hasStartSeq && !hasEndSeq;
   const candidateSlice = forwardFromStart ? matched.slice(0, limitMsgs) : matched.slice(-limitMsgs);
-  const reserveForSummaryAndFooter = 280;
+  const reserveForSummaryAndFooter = 360 + Buffer.byteLength(query, "utf8");
   const headerText = headerLines.join("\n");
   const maxBodyChars = Math.max(400, safeMaxChars - headerText.length - reserveForSummaryAndFooter);
   const maxBodyBytes = Math.max(400, 8650 - Buffer.byteLength(headerText, "utf8") - reserveForSummaryAndFooter);
@@ -2139,12 +2161,18 @@ function formatSwarmMode(entry, {
     const msgHeader = `
 [#${msg.seq} ${msg.time || ""} \xB7 ${msg.agent}${msg.kind ? ` (${msg.kind})` : ""}]
 `;
-    const effectiveClip = Math.max(200, bodyClipLen - msgHeader.length);
-    if (body.length <= effectiveClip) {
+    const msgHeaderBytes = Buffer.byteLength(msgHeader, "utf8");
+    const effectiveCharClip = Math.max(200, bodyClipLen - msgHeader.length);
+    const effectiveByteClip = Math.max(
+      200,
+      (candidateSlice.length === 1 ? maxBodyBytes : Math.min(maxBodyBytes, bodyClipLen * 2)) - msgHeaderBytes
+    );
+    const bodyBytes = Buffer.byteLength(body, "utf8");
+    if (body.length <= effectiveCharClip && bodyBytes <= effectiveByteClip) {
       return `${msgHeader}${body}`;
     }
-    const hint = candidateSlice.length === 1 ? `\u2026 [clipped at ${effectiveClip}/${body.length} chars; full board: ${entry.paths.swarmBoardPath}]` : `\u2026 [clipped at ${effectiveClip}/${body.length} chars; pass startSeq=${msg.seq} endSeq=${msg.seq} for full message]`;
-    return `${msgHeader}${safeSliceChars(body, Math.max(120, effectiveClip - hint.length))}${hint}`;
+    const hint = candidateSlice.length === 1 ? `\u2026 [clipped (${body.length} chars / ${bodyBytes} B); full board: ${entry.paths.swarmBoardPath}]` : `\u2026 [clipped (${body.length} chars); pass startSeq=${msg.seq} endSeq=${msg.seq} for full message]`;
+    return `${msgHeader}${truncateUtf8(body, effectiveCharClip, effectiveByteClip, hint)}`;
   };
   const chosen = [];
   let usedChars = 0;
@@ -2516,8 +2544,8 @@ ${slicedBody}`;
   const nextOffset = safeOffset + chunk.length;
   const footer = `
 \u2026 [truncated; pass charOffset=${nextOffset} (of ${fullBody.length}) to read more]`;
-  return { text: `${headerBlock}
-${chunk.trimEnd()}${footer}`, isError: false };
+  return { text: truncateUtf8(`${headerBlock}
+${chunk.trimEnd()}${footer}`, safeMaxChars), isError: false };
 }
 
 // src/search.ts
@@ -3837,6 +3865,16 @@ function asOptionalNumber(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : void 0;
 }
+function parseStrictBool(v, name) {
+  if (v === void 0 || v === null) return { value: false };
+  if (typeof v === "boolean") return { value: v };
+  if (typeof v === "string") {
+    const norm = v.trim().toLowerCase();
+    if (norm === "" || norm === "false" || norm === "0") return { value: false };
+    if (norm === "true" || norm === "1") return { value: true };
+  }
+  return { value: false, error: `Error: Invalid boolean value "${String(v)}" for ${name}. Expected true or false.` };
+}
 function resolveBoardToolScope(opts) {
   const scopeStr = opts.rawScope.trim() || opts.defaultScope;
   const cid = opts.conversationId.trim();
@@ -3906,6 +3944,8 @@ function executeToolResult(name, rawArgs = {}, opts = {}) {
       });
     }
     case "board_post": {
+      const deleteFlag = parseStrictBool(args.delete, "delete");
+      if (deleteFlag.error) return { text: deleteFlag.error, isError: true };
       const resolved = resolveBoardToolScope({
         rawScope: asString(args.scope),
         conversationId: asString(args.conversationId),
@@ -3920,31 +3960,41 @@ function executeToolResult(name, rawArgs = {}, opts = {}) {
         key: asString(args.key),
         title: asString(args.title),
         body: asString(args.body),
-        delete: Boolean(args.delete),
+        delete: deleteFlag.value,
         expectedRevision: asString(args.expectedRevision),
         source,
         boardsHome
       });
     }
-    case "search_sessions":
+    case "search_sessions": {
+      const regexFlag = parseStrictBool(args.regex, "regex");
+      const allScopesFlag = parseStrictBool(args.allScopes, "allScopes");
+      const includeChildrenFlag = parseStrictBool(args.includeChildren, "includeChildren");
+      const boolErr = regexFlag.error || allScopesFlag.error || includeChildrenFlag.error;
+      if (boolErr) return { text: boolErr, isError: true };
       return searchSessionsResult({
         dataDir,
         query: asString(args.query),
         mode: asString(args.mode) || "text",
         scope: asString(args.scope) || "all",
-        regex: Boolean(args.regex),
+        regex: regexFlag.value,
         conversationId: asString(args.conversationId),
         scopeKey: asString(args.scopeKey),
-        allScopes: Boolean(args.allScopes),
+        allScopes: allScopesFlag.value,
         sessionId: asString(args.sessionId),
         workspace: asString(args.workspace),
-        includeChildren: Boolean(args.includeChildren),
+        includeChildren: includeChildrenFlag.value,
         excludeSessionId: asString(args.excludeSessionId),
         sinceDays: Number(args.sinceDays) || 0,
         maxSessions: asOptionalNumber(args.maxSessions),
         maxChars: asOptionalNumber(args.maxChars)
       });
-    case "read_session":
+    }
+    case "read_session": {
+      const includeToolsFlag = parseStrictBool(args.includeTools, "includeTools");
+      const includeThinkingFlag = parseStrictBool(args.includeThinking, "includeThinking");
+      const boolErr = includeToolsFlag.error || includeThinkingFlag.error;
+      if (boolErr) return { text: boolErr, isError: true };
       return readSessionResult({
         dataDir,
         sessionId: asString(args.sessionId),
@@ -3953,8 +4003,8 @@ function executeToolResult(name, rawArgs = {}, opts = {}) {
         endStep: typeof args.endStep === "number" ? args.endStep : null,
         tailTurns: asOptionalNumber(args.tailTurns),
         charOffset: typeof args.charOffset === "number" ? args.charOffset : 0,
-        includeTools: Boolean(args.includeTools),
-        includeThinking: Boolean(args.includeThinking),
+        includeTools: includeToolsFlag.value,
+        includeThinking: includeThinkingFlag.value,
         artifactName: asString(args.artifactName),
         startLine: asOptionalNumber(args.startLine),
         endLine: asOptionalNumber(args.endLine),
@@ -3964,6 +4014,7 @@ function executeToolResult(name, rawArgs = {}, opts = {}) {
         query: asString(args.query),
         maxChars: asOptionalNumber(args.maxChars)
       });
+    }
     default:
       return { text: `Error: Unknown tool: ${name}`, isError: true };
   }
@@ -3972,7 +4023,7 @@ function executeToolResult(name, rawArgs = {}, opts = {}) {
 // src/mcp-server.ts
 var SERVER_INFO = {
   name: "agy-memory",
-  version: "0.4.1"
+  version: "0.4.2"
 };
 var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
   "2024-11-05",
@@ -4178,6 +4229,8 @@ var BOOLEAN_CLI_FLAGS = /* @__PURE__ */ new Set([
   "all-scopes",
   "regex",
   "include-children",
+  "tools",
+  "thinking",
   "include-tools",
   "include-thinking",
   "delete",
@@ -4272,8 +4325,11 @@ function runCliMode(argv) {
     return;
   }
   if (sub === "read") {
-    const toolsFlag = parseBoolFlag(flags, "tools");
-    const thinkingFlag = parseBoolFlag(flags, "thinking");
+    const toolsFlag = parseBoolFlag(flags, flags["include-tools"] !== void 0 ? "include-tools" : "tools");
+    const thinkingFlag = parseBoolFlag(
+      flags,
+      flags["include-thinking"] !== void 0 ? "include-thinking" : "thinking"
+    );
     if (failBool(toolsFlag) || failBool(thinkingFlag)) return;
     const sessionId = positional[1] || flagString(flags, "session");
     const { text, isError } = executeToolResult(
@@ -4344,6 +4400,8 @@ function runCliMode(argv) {
     return;
   }
   if (sub === "migrate-notes") {
+    const dryRunFlag = parseBoolFlag(flags, "dry-run");
+    if (failBool(dryRunFlag)) return;
     const rawTarget = flagString(flags, "scope") || "global";
     const parsedTarget = parseExplicitScopeKey(rawTarget);
     if (!parsedTarget) {
@@ -4356,10 +4414,12 @@ function runCliMode(argv) {
     const res = migrateLegacyNotes({
       sourceDataDir,
       targetScope: parsedTarget,
-      boardsHome: execOpts.boardsHome
+      boardsHome: execOpts.boardsHome,
+      dryRun: dryRunFlag.value
     });
+    const prefix = dryRunFlag.value ? "[dry-run] " : "";
     process.stdout.write(
-      `Migrated legacy notes from ${sourceDataDir}: imported=${res.imported}, skipped=${res.skipped}
+      `${prefix}Migrated legacy notes from ${sourceDataDir}: imported=${res.imported}, skipped=${res.skipped}
 ${res.details.join("\n")}
 `
     );
@@ -4372,7 +4432,7 @@ ${res.details.join("\n")}
       "  node dist/mcp-server.mjs --cli board-post --key <slug> --body <md> [--title <t>] [--conversation <id> | --scope global|project/<id>] [--rev <hash>] [--delete]",
       "  node dist/mcp-server.mjs --cli search [--mode text|file_history|error_history] [--conversation <id>] [--all-scopes] [--workspace <dir>] [--limit 10] [query]",
       "  node dist/mcp-server.mjs --cli read <sessionId> [--mode digest|turns|artifacts|swarm] [--tail 20] [--start-seq N] [--end-seq N] [--char-offset N]",
-      "  node dist/mcp-server.mjs --cli migrate-notes --scope global|project/<id> [--data-dir <dir>]"
+      "  node dist/mcp-server.mjs --cli migrate-notes --scope global|project/<id> [--data-dir <dir>] [--dry-run]"
     ].join("\n") + "\n"
   );
 }

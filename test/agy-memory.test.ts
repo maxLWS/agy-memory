@@ -685,7 +685,7 @@ test("bundled MCP stdio server handles JSONL, LSP (Content-Type before Content-L
     assert.equal(responses.length, 6);
     assert.equal(responses[0]!.id, 0);
     const initResult = responses[0]!.result as Record<string, unknown>;
-    assert.equal((initResult.serverInfo as Record<string, unknown>).version, "0.4.1");
+    assert.equal((initResult.serverInfo as Record<string, unknown>).version, "0.4.2");
     assert.ok(typeof initResult.instructions === "string" && initResult.instructions.includes("board_read"));
     const listedTools = (responses[1]!.result as Record<string, unknown>).tools as Array<{
       name: string;

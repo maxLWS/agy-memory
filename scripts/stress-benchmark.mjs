@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Layer-1 Deterministic Contract & Latency Benchmark for agy-memory v0.4.1.
+ * Layer-1 Deterministic Contract & Latency Benchmark for agy-memory v0.4.2.
  * - Exercises 60-session archive corpus + dual-project isolation + Project Blackboard.
  * - Verifies strict <=8650 B UTF-8 MCP inline bounds and <=1536 B SessionStart board cap.
  * - Reports 30-run cold/warm p50 and min-max latencies per core operation.

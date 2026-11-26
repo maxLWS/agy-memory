@@ -1,7 +1,7 @@
 {
   "name": "agy-memory",
   "displayName": "agy-memory",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "logo": "assets/logo.svg",
   "description": "Project Blackboard and Verbatim Session Archive for Google Antigravity (App, CLI, and IDE).",
   "author": {

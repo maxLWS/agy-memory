@@ -52,7 +52,7 @@ node ~/.gemini/config/plugins/agy-memory/dist/mcp-server.mjs --cli migrate-notes
 
 - **Turn 0 共享项目黑板，同目录双项目绝不串味。** 命名项目严格按 `project_id` 隔离（新会话尚未入汇总库前直接从 `conversations/<id>.db` 读取 Protobuf 字段 18），两个共用同一仓库目录的 Project 互不泄漏；普通 CLI 自动合并多个 Git linked worktree。
 - **原生溯源能力全部保留，Swarm 长消息不再截断。** 自动从 `transcript_full.jsonl` 补全被截断的长回复，核验文件到底是被改过还是只读过（`mode="file_history"`），回查命令报错退出码与后续复跑结果（`mode="error_history"`），并在 `v0.4.1` 放开单条 Swarm 消息 1,400 字硬截断。
-- **比以往所有版本都更轻。** 砍掉 Codex/Claude 适配器、旧版全局锁笔记和独立 `list_sessions` 后，收敛为 **4 个工具**、**源码净减 670 行**、启动钩子中位 **58.5 ms**，并把首轮提示词税压到 **`v0.1.0` 以来最低**（较 `v0.3.0` 降 20%，较 `v0.2.0` 降 32%）。
+- **比以往所有版本都更轻。** 砍掉 Codex/Claude 适配器、旧版全局锁笔记和独立 `list_sessions` 后，收敛为 **4 个工具**、**源码较 `v0.3.0` 净减 341 行**（`6,309 -> 5,968`）、启动钩子中位 **58.5 ms**，并把首轮提示词税压到 **`v0.1.0` 以来最低**（较 `v0.3.0` 降 20%，较 `v0.2.0` 降 32%）。
 
 ## 全版本实测演进（`v0.1.0` -> `v0.4.1`）
 
@@ -62,9 +62,9 @@ node ~/.gemini/config/plugins/agy-memory/dist/mcp-server.mjs --cli migrate-notes
 
 | 版本 | 历史归档综合召回（`T1–T7`） | 文件 / 报错 / Swarm 溯源 | 项目黑板与隔离（`B1–B5`） | 首轮提示词税 |
 | :--- | :--- | :--- | :--- | :--- |
-| **不装插件** | `594.4s` 模型耗时，`699k` tok，`10` 次溢盘 | `file`：`113.5s` · `error`：`78.2s` · Swarm：超时（`125.7s`） | `0/15`（0%） | 基线（`9,617` tok） |
+| **不装插件** | `594.4s` 模型耗时，`699k` tok，`10` 次溢盘 | `file`：`113.5s` · `error`：`78.2s`（`v0.3` 补提示前） · Swarm：超时（`125.7s`） | `0/15`（0%） | 基线（`9,617` tok） |
 | **`v0.2.0`** | **`213.2s`（-64%）**，`374k` tok，**`0` 溢盘** | 无 trace 模式（`90.0s`） | 无 `project_id` 黑板 | `+3,907` tok（`11,022 B`） |
-| **`v0.3.0`** | **`208.7s`（-65%）**，`375k` tok，**`0` 溢盘** | `file`：**`21.6s`** · `error`：**`21.6s`** · Swarm：超时（`126.0s`） | Gemini `11/15`、Claude `6/10`（**双项目 `0/5` 串味**） | `+3,304` tok（`7,674 B`） |
+| **`v0.3.0`** | **`208.7s`（-65%）**，`375k` tok，**`0` 溢盘** | `file`：**`21.6s`** · `error`：**`21.6s`** · Swarm：超时（`126.0s`） | Gemini `11/15`、Claude `6/10`（**双项目隔离 `0/5` 通过，`5/5` 串味**） | `+3,304` tok（`7,674 B`） |
 | **`v0.4.1`** | 全部保留（`T7` `44.7s`、`T9` `16.9s`、`0` 溢盘） | **`file`/`error` 保留 + Swarm `50.4s` / `5` 轮 / `0` 溢盘** | **Gemini `15/15`、Claude `10/10`（双项目 `5/5` 零泄漏）** | **`+2,648` tok（`7,092 B`，4 工具）** |
 
 完整逐题对比、中位数与区间以及 `v0.1.0 -> v0.4.1` 每次排障复盘见 [docs/BENCHMARK_REPORT.zh-CN.md](./docs/BENCHMARK_REPORT.zh-CN.md)。
@@ -91,8 +91,9 @@ Use `retry_backoff_ms=450`, header `X-Epoch-812`, and `max_batch=32`.
 
 ```text
 [agy-memory] session=51459fb0 (id=51459fb0-..., scope=project/api-v2)
-Project board (1 entry, 184 B):
-- retry-policy [rev=e6aa61696c47, src=cli:a629d4f8]: Use `retry_backoff_ms=450`, header `X-Epoch-812`, and `max_batch=32`.
+Project board (1 active, inline):
+## retry-policy — HTTP retry policy (rev=e6aa61696c47 · 2h ago · from a629d4f8)
+Use `retry_backoff_ms=450`, header `X-Epoch-812`, and `max_batch=32`.
 ```
 
 ![agy-memory v0.4 架构图](./assets/architecture-zh.svg)

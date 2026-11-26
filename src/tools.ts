@@ -139,6 +139,17 @@ function asOptionalNumber(v: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+function parseStrictBool(v: unknown, name: string): { value: boolean; error?: string } {
+  if (v === undefined || v === null) return { value: false };
+  if (typeof v === "boolean") return { value: v };
+  if (typeof v === "string") {
+    const norm = v.trim().toLowerCase();
+    if (norm === "" || norm === "false" || norm === "0") return { value: false };
+    if (norm === "true" || norm === "1") return { value: true };
+  }
+  return { value: false, error: `Error: Invalid boolean value "${String(v)}" for ${name}. Expected true or false.` };
+}
+
 function resolveBoardToolScope(opts: {
   rawScope: string;
   conversationId: string;
@@ -230,6 +241,8 @@ export function executeToolResult(
       });
     }
     case "board_post": {
+      const deleteFlag = parseStrictBool(args.delete, "delete");
+      if (deleteFlag.error) return { text: deleteFlag.error, isError: true };
       const resolved = resolveBoardToolScope({
         rawScope: asString(args.scope),
         conversationId: asString(args.conversationId),
@@ -246,31 +259,41 @@ export function executeToolResult(
         key: asString(args.key),
         title: asString(args.title),
         body: asString(args.body),
-        delete: Boolean(args.delete),
+        delete: deleteFlag.value,
         expectedRevision: asString(args.expectedRevision),
         source,
         boardsHome,
       });
     }
-    case "search_sessions":
+    case "search_sessions": {
+      const regexFlag = parseStrictBool(args.regex, "regex");
+      const allScopesFlag = parseStrictBool(args.allScopes, "allScopes");
+      const includeChildrenFlag = parseStrictBool(args.includeChildren, "includeChildren");
+      const boolErr = regexFlag.error || allScopesFlag.error || includeChildrenFlag.error;
+      if (boolErr) return { text: boolErr, isError: true };
       return searchSessionsResult({
         dataDir,
         query: asString(args.query),
         mode: asString(args.mode) || "text",
         scope: asString(args.scope) || "all",
-        regex: Boolean(args.regex),
+        regex: regexFlag.value,
         conversationId: asString(args.conversationId),
         scopeKey: asString(args.scopeKey),
-        allScopes: Boolean(args.allScopes),
+        allScopes: allScopesFlag.value,
         sessionId: asString(args.sessionId),
         workspace: asString(args.workspace),
-        includeChildren: Boolean(args.includeChildren),
+        includeChildren: includeChildrenFlag.value,
         excludeSessionId: asString(args.excludeSessionId),
         sinceDays: Number(args.sinceDays) || 0,
         maxSessions: asOptionalNumber(args.maxSessions),
         maxChars: asOptionalNumber(args.maxChars),
       });
-    case "read_session":
+    }
+    case "read_session": {
+      const includeToolsFlag = parseStrictBool(args.includeTools, "includeTools");
+      const includeThinkingFlag = parseStrictBool(args.includeThinking, "includeThinking");
+      const boolErr = includeToolsFlag.error || includeThinkingFlag.error;
+      if (boolErr) return { text: boolErr, isError: true };
       return readSessionResult({
         dataDir,
         sessionId: asString(args.sessionId),
@@ -279,8 +302,8 @@ export function executeToolResult(
         endStep: typeof args.endStep === "number" ? args.endStep : null,
         tailTurns: asOptionalNumber(args.tailTurns),
         charOffset: typeof args.charOffset === "number" ? args.charOffset : 0,
-        includeTools: Boolean(args.includeTools),
-        includeThinking: Boolean(args.includeThinking),
+        includeTools: includeToolsFlag.value,
+        includeThinking: includeThinkingFlag.value,
         artifactName: asString(args.artifactName),
         startLine: asOptionalNumber(args.startLine),
         endLine: asOptionalNumber(args.endLine),
@@ -290,6 +313,7 @@ export function executeToolResult(
         query: asString(args.query),
         maxChars: asOptionalNumber(args.maxChars),
       });
+    }
     default:
       return { text: `Error: Unknown tool: ${name}`, isError: true };
   }

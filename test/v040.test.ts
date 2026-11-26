@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -392,12 +392,15 @@ test("Board persistence enforces per-key CAS conflict under multi-process conten
     await new Promise((resolve) => lockProc.on("close", resolve));
     assert.equal(readUnderLock.projectId, "wal-proj", "WAL read should succeed cleanly alongside writer");
 
-    // Legacy notes migration is idempotent and non-destructive
+    // Legacy v0.3 notes migration uses plugin_data/agy-memory/memory/topics, supports dryRun, and is idempotent
     const legacyDir = path.join(tmp, "legacy");
-    const topicsDir = path.join(legacyDir, "memory", "topics");
+    const topicsDir = path.join(legacyDir, "plugin_data", "agy-memory", "memory", "topics");
     fs.mkdirSync(topicsDir, { recursive: true });
     const legacyFile = path.join(topicsDir, "keep-gpu.md");
     fs.writeFileSync(legacyFile, '---\nschema: 1\nid: "keep-gpu"\ntopic: "GPU Guard"\n---\nUse smart_keep_gpu.\n');
+    const dry = migrateLegacyNotes({ sourceDataDir: legacyDir, targetScope: { kind: "global" }, boardsHome, dryRun: true });
+    assert.equal(dry.imported, 1);
+    assert.equal(dry.skipped, 0);
     const m1 = migrateLegacyNotes({ sourceDataDir: legacyDir, targetScope: { kind: "global" }, boardsHome });
     assert.equal(m1.imported, 1);
     assert.ok(fs.existsSync(legacyFile), "original legacy file must remain untouched");
@@ -710,6 +713,126 @@ test("v0.4.1 regression: read_session(mode=swarm) returns full 3.5KB single mess
     assert.ok(exact.includes("DEEP_VERDICT_MARKER_3200"), exact);
     assert.ok(exact.includes("delta_cf=30.0%"), exact);
     assert.ok(Buffer.byteLength(exact, "utf8") <= 8650, `exceeded inline cap: ${Buffer.byteLength(exact, "utf8")}`);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("v0.4.2 regressions: strict MCP booleans, CJK Swarm recovery path, CLI read flags, and multi-client Swarm merge", () => {
+  clearStoreCaches();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-v042-reg-"));
+  const boardsHome = path.join(tmp, "boards");
+  try {
+    // 1) MCP boundary must not coerce string "false" into true for allScopes or delete
+    const scopedReject = executeToolResult(
+      "search_sessions",
+      { allScopes: "false", query: "anything" },
+      { dataDir: tmp },
+    );
+    assert.equal(scopedReject.isError, true, scopedReject.text);
+
+    const posted = executeToolResult(
+      "board_post",
+      { scope: "global", key: "keep-alive", body: "still here" },
+      { dataDir: tmp, boardsHome },
+    );
+    assert.equal(posted.isError, false, posted.text);
+    const rev = /Revision:\s*([0-9a-f]{12})/.exec(posted.text)![1]!;
+    const notDeleted = executeToolResult(
+      "board_post",
+      { scope: "global", key: "keep-alive", body: "updated body", expectedRevision: rev, delete: "false" },
+      { dataDir: tmp, boardsHome },
+    );
+    assert.equal(notDeleted.isError, false, notDeleted.text);
+    assert.ok(notDeleted.text.includes("Updated"), notDeleted.text);
+
+    // 2) Multibyte CJK single Swarm message exceeding 8,650 bytes preserves full board.jsonl path
+    const sid = "88888888-1111-2222-3333-444444444444";
+    const swarmDir = path.join(tmp, "brain", sid, ".system_generated", "swarm");
+    fs.mkdirSync(swarmDir, { recursive: true });
+    const cjkBody = "中文评审结论记录。".repeat(400); // 3,600 chars / 10,800 UTF-8 bytes
+    const boardPath = path.join(swarmDir, "board.jsonl");
+    fs.writeFileSync(
+      boardPath,
+      `${JSON.stringify({ seq: 1, time: "2026-11-26 06:00:00", agent: "reviewer", text: cjkBody })}\n`,
+    );
+    const cjkOut = executeTool("read_session", { sessionId: sid, mode: "swarm", startSeq: 1, endSeq: 1 }, { dataDir: tmp });
+    assert.ok(Buffer.byteLength(cjkOut, "utf8") <= 8650, `CJK Swarm exceeded cap: ${Buffer.byteLength(cjkOut, "utf8")}`);
+    assert.ok(cjkOut.includes(boardPath), `Missing board.jsonl recovery path:\n${cjkOut.slice(-300)}`);
+
+    // 3) CLI read accepts --tools and --include-tools without swallowing positional sessionId
+    const bundle = path.resolve("dist/mcp-server.mjs");
+    const logDir = path.join(tmp, "brain", sid, ".system_generated", "logs");
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDir, "transcript.jsonl"),
+      `${JSON.stringify({ step: 1, type: "USER_INPUT", content: "hi" })}\n${JSON.stringify({ step: 2, type: "PLANNER_RESPONSE", content: "ok", tool_calls: [{ name: "read_file" }] })}\n`,
+    );
+    const cliTools = spawnSync(
+      process.execPath,
+      [bundle, "--cli", "read", "--data-dir", tmp, "--mode", "turns", "--tools", sid],
+      { encoding: "utf8" },
+    );
+    assert.equal(cliTools.status, 0, cliTools.stderr || cliTools.stdout);
+    assert.ok(cliTools.stdout.includes("Tools: read_file"), cliTools.stdout);
+
+    const cliIncTools = spawnSync(
+      process.execPath,
+      [bundle, "--cli", "read", "--data-dir", tmp, "--mode", "turns", "--include-tools", sid],
+      { encoding: "utf8" },
+    );
+    assert.equal(cliIncTools.status, 0, cliIncTools.stderr || cliIncTools.stdout);
+    assert.ok(cliIncTools.stdout.includes("Tools: read_file"), cliIncTools.stdout);
+
+    // 4) CLI migrate-notes --dry-run inspects v0.3 plugin_data path without writing
+    const v03Topics = path.join(tmp, "plugin_data", "agy-memory", "memory", "topics");
+    fs.mkdirSync(v03Topics, { recursive: true });
+    fs.writeFileSync(path.join(v03Topics, "rule-a.md"), '---\nschema: 1\ntopic: "Rule A"\n---\nBody A.\n');
+    const dryCli = spawnSync(
+      process.execPath,
+      [bundle, "--cli", "migrate-notes", "--data-dir", tmp, "--boards-home", boardsHome, "--scope", "global", "--dry-run"],
+      { encoding: "utf8" },
+    );
+    assert.equal(dryCli.status, 0, dryCli.stderr || dryCli.stdout);
+    assert.ok(dryCli.stdout.includes("[dry-run]") && dryCli.stdout.includes("imported=1"), dryCli.stdout);
+    const afterDry = executeTool("board_read", { scope: "global", keys: ["rule-a"] }, { dataDir: tmp, boardsHome });
+    assert.ok(afterDry.includes("Board empty"), afterDry);
+
+    // 5) Multi-client merge preserves Swarm path from newer App copy alongside older CLI transcript
+    const appDir = path.join(tmp, "mc-app");
+    const cliDir = path.join(tmp, "mc-cli");
+    const mSid = "99999999-1111-2222-3333-444444444444";
+    const cliLogDir = path.join(cliDir, "brain", mSid, ".system_generated", "logs");
+    const appSwarmDir = path.join(appDir, "brain", mSid, ".system_generated", "swarm");
+    fs.mkdirSync(cliLogDir, { recursive: true });
+    fs.mkdirSync(appSwarmDir, { recursive: true });
+    const cliTranscript = path.join(cliLogDir, "transcript.jsonl");
+    const appBoard = path.join(appSwarmDir, "board.jsonl");
+    fs.writeFileSync(cliTranscript, `${JSON.stringify({ step: 1, type: "USER_INPUT", content: "hello" })}\n`);
+    fs.writeFileSync(appBoard, `${JSON.stringify({ seq: 1, time: "2026-11-26 07:00:00", agent: "worker", text: "APP_SWARM_OK" })}\n`);
+    const older = new Date("2026-11-26T01:00:00Z");
+    const newer = new Date("2026-11-26T02:00:00Z");
+    fs.utimesSync(cliTranscript, older, older);
+    fs.utimesSync(appBoard, newer, newer);
+    const prevApp = process.env.AGY_APP_DATA_DIR;
+    const prevCli = process.env.AGY_CLI_DATA_DIR;
+    const prevMem = process.env.AGY_MEMORY_DATA_DIR;
+    try {
+      delete process.env.AGY_MEMORY_DATA_DIR;
+      process.env.AGY_APP_DATA_DIR = appDir;
+      process.env.AGY_CLI_DATA_DIR = cliDir;
+      clearStoreCaches();
+      const swarmMerged = executeTool("read_session", { sessionId: mSid, mode: "swarm" });
+      assert.ok(swarmMerged.includes("APP_SWARM_OK"), swarmMerged);
+    } finally {
+      if (prevApp === undefined) delete process.env.AGY_APP_DATA_DIR;
+      else process.env.AGY_APP_DATA_DIR = prevApp;
+      if (prevCli === undefined) delete process.env.AGY_CLI_DATA_DIR;
+      else process.env.AGY_CLI_DATA_DIR = prevCli;
+      if (prevMem === undefined) delete process.env.AGY_MEMORY_DATA_DIR;
+      else process.env.AGY_MEMORY_DATA_DIR = prevMem;
+      clearStoreCaches();
+    }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
