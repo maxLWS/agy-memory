@@ -13,7 +13,9 @@
 2. **文件与报错回溯**：查某个文件在哪些历史会话里被改写过还是只读过（`mode="file_history"`），或者回查历史命令报错、退出码及后续是否跑通（`mode="error_history"`）。
 3. **可编辑 Markdown 笔记**：把长期记忆存成普通 Markdown 文件（`topics/<id>.md` + `MEMORY.md`），带 `expectedRevision` 修订校验防止并发覆盖。
 
-## 整体架构
+已收录于 [Awesome Antigravity Plugins](https://github.com/biTQ-m/awesome-antigravity-plugins/blob/main/README_CN.md#性能加速工程流与多智能体编排) 的「性能加速、工程流与多智能体编排」分类。 
+
+ ## 整体架构
 
 ![agy-memory 架构图](./assets/architecture-zh.svg)
 
