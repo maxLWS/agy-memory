@@ -13,6 +13,8 @@
 2. **File & error history**: check which past sessions edited vs. only read a file (`mode="file_history"`), or look up past command failures, exit codes, and matching reruns (`mode="error_history"`).
 3. **Editable Markdown notes**: store long-lived notes as plain files (`topics/<id>.md` + `MEMORY.md`) with `expectedRevision` compare-and-swap checks.
 
+Listed in [Awesome Antigravity Plugins](https://github.com/biTQ-m/awesome-antigravity-plugins/blob/main/README.md#performance-workflow--swarm-orchestration) under **Performance, Workflow & Swarm Orchestration**.
+
 ## Architecture
 
 ![agy-memory architecture](./assets/architecture.svg)
